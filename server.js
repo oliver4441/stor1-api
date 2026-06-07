@@ -1,5 +1,5 @@
 // Omix Paystack API Server
-// Handles Paystack STK push initialization, verification, webhook, and split payments
+// Handles Paystack inline payment initialization, verification, webhook, and split payments
 // Deploy to Render/Railway/Fly.io as a separate service
 
 import 'dotenv/config';
@@ -27,11 +27,15 @@ const paystackHeaders = {
 };
 
 // ── Health check ──
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', service: 'omix-api', timestamp: new Date().toISOString() });
+});
+
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'omix-api' });
 });
 
-// ── Initialize STK Push with Split Payment ──
+// ── Initialize Paystack Inline Payment ──
 app.post('/api/paystack/initialize', async (req, res) => {
   try {
     const { order_id, email, amount, phone, callback_url } = req.body;
@@ -40,15 +44,14 @@ app.post('/api/paystack/initialize', async (req, res) => {
       return res.status(400).json({ message: 'Missing required fields: email, amount, phone' });
     }
 
-    // Build Paystack payload
-    // Transaction charges paid by buyer (charges_api: false means buyer pays)
+    // Build Paystack payload for inline payment
+    // No channel restriction — Paystack inline supports card, bank, M-Pesa, etc.
     const payload = {
       email,
       amount: Math.round(amount * 100), // Paystack expects amount in cents/kobo
       currency: 'KES',
       callback_url: callback_url || `${process.env.FRONTEND_URL || 'https://stor1-web.onrender.com'}/events/order/callback`,
       metadata: { order_id },
-      channels: ['mobile_money'],
     };
 
     // If we have a subaccount for split payment, include it
