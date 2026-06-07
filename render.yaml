@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: stor1-api
+    runtime: node
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PAYSTACK_SECRET_KEY
+        sync: false
+      - key: PAYSTACK_PUBLIC_KEY
+        sync: false
+      - key: OMIX_SUBACCOUNT_CODE
+        sync: false
+      - key: FRONTEND_URL
+        value: https://stor1-web.onrender.com
+      - key: ADMIN_EMAIL
+        value: omixsystems@gmail.com
+      - key: PORT
+        value: "3001"
