@@ -40,8 +40,8 @@ app.post('/api/paystack/initialize', async (req, res) => {
   try {
     const { order_id, email, amount, phone, callback_url } = req.body;
 
-    if (!email || !amount || !phone) {
-      return res.status(400).json({ message: 'Missing required fields: email, amount, phone' });
+    if (!email || !amount) {
+      return res.status(400).json({ message: 'Missing required fields: email, amount' });
     }
 
     // Build Paystack payload for inline payment
