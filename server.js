@@ -44,7 +44,7 @@ app.post('/api/nia/chat', async (req, res) => {
   if (!messages || !Array.isArray(messages)) return res.status(400).json({ error: 'Messages required' });
 
   try {
-    const resp = await fetch('https://api.opencode.ai/zen/v1/chat/completions', {
+    const resp = await fetch('https://opencode.ai/zen/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
       body: JSON.stringify({
@@ -55,6 +55,7 @@ app.post('/api/nia/chat', async (req, res) => {
         ],
         max_tokens: 500,
         temperature: 0.7,
+        reasoning_effort: 'none',
       }),
     });
     if (!resp.ok) return res.status(502).json({ error: 'AI service error' });
