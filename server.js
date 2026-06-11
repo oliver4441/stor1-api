@@ -35,6 +35,39 @@ app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'omix-api' });
 });
 
+// ── Nia AI Chat Proxy ──────────────────────────────────────────────
+app.post('/api/nia/chat', async (req, res) => {
+  const apiKey = process.env.VITE_OPENCODE_API_KEY;
+  if (!apiKey) return res.status(503).json({ error: 'AI service not configured' });
+
+  const { messages, model = 'mimo-v2.5-free' } = req.body;
+  if (!messages || !Array.isArray(messages)) return res.status(400).json({ error: 'Messages required' });
+
+  try {
+    const resp = await fetch('https://opencode.ai/zen/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: 'system', content: 'You are Nia, the Omix Store assistant in Kericho, Kenya. Help with products, orders, M-Pesa payments (Paystack STK Push), delivery. Be concise (under 80 words). Never make up info. Offer human support (omixsystems@gmail.com / +254 768 213 649) if unsure.' },
+          ...messages,
+        ],
+        max_tokens: 500,
+        temperature: 0.7,
+      }),
+    });
+    if (!resp.ok) return res.status(502).json({ error: 'AI service error' });
+    const data = await resp.json();
+    const content = data?.choices?.[0]?.message?.content?.trim() || null;
+    if (!content) return res.status(502).json({ error: 'Empty AI response' });
+    res.json({ content });
+  } catch (err) {
+    console.error('[Nia]', err.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // ── Initialize Paystack Inline Payment ──
 app.post('/api/paystack/initialize', async (req, res) => {
   try {
