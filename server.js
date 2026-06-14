@@ -6,6 +6,8 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
+import { createClient } from '@supabase/supabase-js';
+import email from './lib/email.js';
 
 const app = express();
 app.use(cors());
@@ -13,8 +15,22 @@ app.use(express.json());
 
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
 const PAYSTACK_PUBLIC = process.env.PAYSTACK_PUBLIC_KEY;
-const OMIX_SUBACCOUNT_CODE = process.env.OMIX_SUBACCOUNT_CODE; // Your Paystack subaccount for receiving commissions
+const OMIX_SUBACCOUNT_CODE = process.env.OMIX_SUBACCOUNT_CODE;
 const PORT = process.env.PORT || 3001;
+
+// Supabase client for maintenance mode checks
+let supabase = null;
+if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
+  try {
+    supabase = createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_KEY
+    );
+  } catch (err) {
+    console.warn('Failed to initialize Supabase client:', err.message);
+    supabase = null;
+  }
+}
 
 if (!PAYSTACK_SECRET) {
   console.error('PAYSTACK_SECRET_KEY not set!');
@@ -69,17 +85,21 @@ app.post('/api/nia/chat', async (req, res) => {
   }
 });
 
-// ── Initialize Paystack Inline Payment ──
+// ── Initialize Paystack Inline Payment ─────────────────────────────────────────
 app.post('/api/paystack/initialize', async (req, res) => {
   try {
-    // Check maintenance mode first
-    const { data: maintData } = await supabase
-      .from('app_settings')
-      .select('value')
-      .eq('key', 'maintenance_mode')
-      .single();
-    if (maintData?.value === true) {
-      return res.status(503).json({ message: 'Store is under maintenance. Payments are temporarily disabled.' });
+    // Check maintenance mode first (if Supabase is available)
+    if (supabase) {
+      const { data: maintData } = await supabase
+        .from('app_settings')
+        .select('value')
+        .eq('key', 'maintenance_mode')
+        .single();
+      if (maintData?.value === true) {
+        return res.status(503).json({ message: 'Store is under maintenance. Payments are temporarily disabled.' });
+      }
+    } else {
+      console.warn('Supabase not available — maintenance mode check skipped');
     }
 
     const { order_id, email, amount, phone, callback_url } = req.body;
@@ -186,10 +206,34 @@ app.post('/api/paystack/webhook', express.raw({ type: 'application/json' }), asy
 
       if (metadata?.order_id && status === 'success') {
         console.log(`✅ Payment confirmed for order ${metadata.order_id}`);
-        // The frontend polling handles the rest, but you could also:
-        // - Send email confirmation
-        // - Update Supabase directly via service role
-        // - Trigger push notification
+
+        // Send order confirmation email
+        try {
+          // Fetch order details from Supabase
+          const { data: order } = await supabase
+            .from('omix_orders')
+            .select('id, email, customer_name, total, area, landmark, order_items')
+            .eq('id', metadata.order_id)
+            .single();
+
+          if (order?.email) {
+            const items = typeof order.order_items === 'string'
+              ? JSON.parse(order.order_items)
+              : (order.order_items || []);
+
+            email.sendOrderConfirmation({
+              to: order.email,
+              orderId: order.id,
+              items,
+              total: order.total,
+              customerName: order.customer_name,
+              deliveryArea: order.area,
+              deliveryLandmark: order.landmark,
+            }).catch(err => console.error('[Email] Order confirmation failed:', err.message));
+          }
+        } catch (emailErr) {
+          console.error('[Email] Failed to send order confirmation:', emailErr.message);
+        }
       }
     }
 
@@ -198,6 +242,86 @@ app.post('/api/paystack/webhook', express.raw({ type: 'application/json' }), asy
   } catch (error) {
     console.error('Webhook error:', error);
     res.status(200).send('OK'); // Still return 200 to prevent retries
+  }
+});
+
+// ── Public API endpoints for email services ─────────────────────────────────────
+
+// Send welcome email after user signup
+app.post('/api/email/welcome', async (req, res) => {
+  try {
+    const { to, name } = req.body;
+    if (!to) return res.status(400).json({ message: 'Email address required' });
+
+    const result = await email.sendWelcomeEmail({ to, name });
+    res.json({ success: result.sent, message: result.sent ? 'Welcome email sent' : 'Welcome email skipped (no API key)' });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to send welcome email', error: err.message });
+  }
+});
+
+// Send referral reward notification
+app.post('/api/email/referral-reward', async (req, res) => {
+  try {
+    const { to, referralCode, rewardAmount, customerName } = req.body;
+    if (!to) return res.status(400).json({ message: 'Email address required' });
+
+    const result = await email.sendReferralReward({ to, referralCode, rewardAmount, customerName });
+    res.json({ success: result.sent, message: result.sent ? 'Referral reward email sent' : 'Referral reward email skipped (no API key)' });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to send referral reward email', error: err.message });
+  }
+});
+
+// Send order status update
+app.post('/api/email/order-status', async (req, res) => {
+  try {
+    const { to, orderId, status, customerName } = req.body;
+    if (!to) return res.status(400).json({ message: 'Email address required' });
+
+    const result = await email.sendOrderStatusUpdate({ to, orderId, status, customerName });
+    res.json({ success: result.sent, message: result.sent ? 'Order status email sent' : 'Order status email skipped (no API key)' });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to send order status email', error: err.message });
+  }
+});
+
+// Send price drop alert
+app.post('/api/email/price-drop', async (req, res) => {
+  try {
+    const { to, productName, productUrl, oldPrice, newPrice, productImage } = req.body;
+    if (!to) return res.status(400).json({ message: 'Email address required' });
+
+    const result = await email.sendPriceDropAlert({ to, productName, productUrl, oldPrice, newPrice, productImage });
+    res.json({ success: result.sent, message: result.sent ? 'Price drop alert sent' : 'Price drop alert skipped (no API key)' });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to send price drop alert', error: err.message });
+  }
+});
+
+// Send back in stock alert
+app.post('/api/email/back-in-stock', async (req, res) => {
+  try {
+    const { to, productName, productUrl, price } = req.body;
+    if (!to) return res.status(400).json({ message: 'Email address required' });
+
+    const result = await email.sendBackInStockAlert({ to, productName, productUrl, price });
+    res.json({ success: result.sent, message: result.sent ? 'Back in stock alert sent' : 'Back in stock alert skipped (no API key)' });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to send back in stock alert', error: err.message });
+  }
+});
+
+// Send abandoned cart reminder
+app.post('/api/email/abandoned-cart', async (req, res) => {
+  try {
+    const { to, items, total, customerName } = req.body;
+    if (!to) return res.status(400).json({ message: 'Email address required' });
+
+    const result = await email.sendAbandonedCartReminder({ to, items, total, customerName });
+    res.json({ success: result.sent, message: result.sent ? 'Abandoned cart reminder sent' : 'Abandoned cart reminder skipped (no API key)' });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to send abandoned cart reminder', error: err.message });
   }
 });
 
