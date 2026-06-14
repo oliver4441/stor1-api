@@ -72,6 +72,16 @@ app.post('/api/nia/chat', async (req, res) => {
 // ── Initialize Paystack Inline Payment ──
 app.post('/api/paystack/initialize', async (req, res) => {
   try {
+    // Check maintenance mode first
+    const { data: maintData } = await supabase
+      .from('app_settings')
+      .select('value')
+      .eq('key', 'maintenance_mode')
+      .single();
+    if (maintData?.value === true) {
+      return res.status(503).json({ message: 'Store is under maintenance. Payments are temporarily disabled.' });
+    }
+
     const { order_id, email, amount, phone, callback_url } = req.body;
 
     if (!email || !amount) {
