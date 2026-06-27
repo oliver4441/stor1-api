@@ -222,11 +222,17 @@ app.post('/api/paystack/webhook', express.raw({ type: 'application/json' }), asy
         try {
           const { data: existing } = await supabase
             .from('omix_orders')
-            .select('id, status, email, customer_name, total, area, landmark, order_items')
+            .select('id, status, email, customer_name, total_amount, area, landmark')
             .eq('id', metadata.order_id)
             .single();
 
           if (existing && existing.status !== 'paid') {
+            // Fetch order items for email
+            const { data: orderItems } = await supabase
+              .from('omix_order_items')
+              .select('product_name, price, quantity, variant')
+              .eq('order_id', metadata.order_id);
+
             await supabase
               .from('omix_orders')
               .update({ status: 'paid', paystack_reference: reference, paid_at: new Date().toISOString() })
@@ -236,17 +242,24 @@ app.post('/api/paystack/webhook', express.raw({ type: 'application/json' }), asy
             console.log(`Order ${metadata.order_id} already paid, skipping update`);
           }
 
-          // Send order confirmation email
+          // Send order confirmation email with receipt
           if (existing?.email) {
-            const items = typeof existing.order_items === 'string'
-              ? JSON.parse(existing.order_items)
-              : (existing.order_items || []);
+            const { data: orderItems } = await supabase
+              .from('omix_order_items')
+              .select('product_name, price, quantity, variant')
+              .eq('order_id', metadata.order_id);
+
+            // Enrich items with variant info (size/color)
+            const itemsForEmail = (orderItems || []).map(item => ({
+              ...item,
+              name: item.product_name + (item.variant?.size ? ` (${item.variant.size})` : '') + (item.variant?.colorName ? ` — ${item.variant.colorName}` : ''),
+            }));
 
             email.sendOrderConfirmation({
               to: existing.email,
               orderId: existing.id,
-              items,
-              total: existing.total,
+              items: itemsForEmail,
+              total: existing.total_amount,
               customerName: existing.customer_name,
               deliveryArea: existing.area,
               deliveryLandmark: existing.landmark,
@@ -254,6 +267,42 @@ app.post('/api/paystack/webhook', express.raw({ type: 'application/json' }), asy
           }
         } catch (dbErr) {
           console.error('[DB] Failed to process order:', dbErr.message);
+        }
+      }
+    }
+
+    // Handle payment failure
+    if (event.event === 'charge.failed') {
+      const { reference, status, metadata, amount } = event.data;
+      console.log(`Payment failed for order ${metadata?.order_id}`);
+
+      if (metadata?.order_id) {
+        try {
+          const { data: existing } = await supabase
+            .from('omix_orders')
+            .select('id, status, email, customer_name, total_amount')
+            .eq('id', metadata.order_id)
+            .single();
+
+          if (existing && existing.status === 'pending') {
+            await supabase
+              .from('omix_orders')
+              .update({ status: 'payment_failed' })
+              .eq('id', metadata.order_id);
+          }
+
+          // Send payment failure email
+          if (existing?.email) {
+            email.sendPaymentFailed({
+              to: existing.email,
+              orderId: existing.id,
+              customerName: existing.customer_name,
+              amount: existing.total_amount,
+              reference,
+            }).catch(err => console.error('[Email] Payment failure email failed:', err.message));
+          }
+        } catch (dbErr) {
+          console.error('[DB] Failed to process payment failure:', dbErr.message);
         }
       }
     }
