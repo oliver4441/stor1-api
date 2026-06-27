@@ -3,6 +3,7 @@
 // Deploy to Render/Railway/Fly.io as a separate service
 
 import 'dotenv/config';
+import crypto from 'crypto';
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
@@ -10,7 +11,11 @@ import { createClient } from '@supabase/supabase-js';
 import email from './lib/email.js';
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: ['https://stor1-web.onrender.com', 'http://localhost:5173'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
+  credentials: true,
+}));
 app.use(express.json());
 
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
@@ -193,9 +198,10 @@ app.post('/api/paystack/webhook', express.raw({ type: 'application/json' }), asy
     const signature = req.headers['x-paystack-signature'];
     const body = req.body;
 
-    // Verify webhook signature in production
-    // const hash = crypto.createHmac('sha512', PAYSTACK_SECRET).update(body).digest('hex');
-    // if (hash !== signature) return res.status(401).json({ message: 'Invalid signature' });
+    // Verify webhook signature
+    if (!signature) return res.status(401).json({ message: 'Missing signature' });
+    const hash = crypto.createHmac('sha512', PAYSTACK_SECRET).update(body).digest('hex');
+    if (hash !== signature) return res.status(401).json({ message: 'Invalid signature' });
 
     const event = JSON.parse(body.toString());
 
@@ -205,34 +211,44 @@ app.post('/api/paystack/webhook', express.raw({ type: 'application/json' }), asy
       const { reference, status, metadata } = event.data;
 
       if (metadata?.order_id && status === 'success') {
-        console.log(`✅ Payment confirmed for order ${metadata.order_id}`);
+        console.log(`Payment confirmed for order ${metadata.order_id}`);
 
-        // Send order confirmation email
+        // Update order status (idempotent: skip if already paid)
         try {
-          // Fetch order details from Supabase
-          const { data: order } = await supabase
+          const { data: existing } = await supabase
             .from('omix_orders')
-            .select('id, email, customer_name, total, area, landmark, order_items')
+            .select('id, status, email, customer_name, total, area, landmark, order_items')
             .eq('id', metadata.order_id)
             .single();
 
-          if (order?.email) {
-            const items = typeof order.order_items === 'string'
-              ? JSON.parse(order.order_items)
-              : (order.order_items || []);
+          if (existing && existing.status !== 'paid') {
+            await supabase
+              .from('omix_orders')
+              .update({ status: 'paid', paystack_reference: reference, paid_at: new Date().toISOString() })
+              .eq('id', metadata.order_id);
+            console.log(`Order ${metadata.order_id} marked as paid`);
+          } else if (existing?.status === 'paid') {
+            console.log(`Order ${metadata.order_id} already paid, skipping update`);
+          }
+
+          // Send order confirmation email
+          if (existing?.email) {
+            const items = typeof existing.order_items === 'string'
+              ? JSON.parse(existing.order_items)
+              : (existing.order_items || []);
 
             email.sendOrderConfirmation({
-              to: order.email,
-              orderId: order.id,
+              to: existing.email,
+              orderId: existing.id,
               items,
-              total: order.total,
-              customerName: order.customer_name,
-              deliveryArea: order.area,
-              deliveryLandmark: order.landmark,
+              total: existing.total,
+              customerName: existing.customer_name,
+              deliveryArea: existing.area,
+              deliveryLandmark: existing.landmark,
             }).catch(err => console.error('[Email] Order confirmation failed:', err.message));
           }
-        } catch (emailErr) {
-          console.error('[Email] Failed to send order confirmation:', emailErr.message);
+        } catch (dbErr) {
+          console.error('[DB] Failed to process order:', dbErr.message);
         }
       }
     }
@@ -245,10 +261,20 @@ app.post('/api/paystack/webhook', express.raw({ type: 'application/json' }), asy
   }
 });
 
+// ── API Key Auth Middleware ────────────────────────────────────────────────
+const API_KEY = process.env.API_KEY;
+const requireApiKey = (req, res, next) => {
+  const key = req.headers['x-api-key'];
+  if (!API_KEY || key !== API_KEY) {
+    return res.status(401).json({ message: 'Unauthorized' });
+  }
+  next();
+};
+
 // ── Public API endpoints for email services ─────────────────────────────────────
 
 // Send welcome email after user signup
-app.post('/api/email/welcome', async (req, res) => {
+app.post('/api/email/welcome', requireApiKey, async (req, res) => {
   try {
     const { to, name } = req.body;
     if (!to) return res.status(400).json({ message: 'Email address required' });
@@ -261,7 +287,7 @@ app.post('/api/email/welcome', async (req, res) => {
 });
 
 // Send referral reward notification
-app.post('/api/email/referral-reward', async (req, res) => {
+app.post('/api/email/referral-reward', requireApiKey, async (req, res) => {
   try {
     const { to, referralCode, rewardAmount, customerName } = req.body;
     if (!to) return res.status(400).json({ message: 'Email address required' });
@@ -274,7 +300,7 @@ app.post('/api/email/referral-reward', async (req, res) => {
 });
 
 // Send order status update
-app.post('/api/email/order-status', async (req, res) => {
+app.post('/api/email/order-status', requireApiKey, async (req, res) => {
   try {
     const { to, orderId, status, customerName } = req.body;
     if (!to) return res.status(400).json({ message: 'Email address required' });
@@ -287,7 +313,7 @@ app.post('/api/email/order-status', async (req, res) => {
 });
 
 // Send price drop alert
-app.post('/api/email/price-drop', async (req, res) => {
+app.post('/api/email/price-drop', requireApiKey, async (req, res) => {
   try {
     const { to, productName, productUrl, oldPrice, newPrice, productImage } = req.body;
     if (!to) return res.status(400).json({ message: 'Email address required' });
@@ -300,7 +326,7 @@ app.post('/api/email/price-drop', async (req, res) => {
 });
 
 // Send back in stock alert
-app.post('/api/email/back-in-stock', async (req, res) => {
+app.post('/api/email/back-in-stock', requireApiKey, async (req, res) => {
   try {
     const { to, productName, productUrl, price } = req.body;
     if (!to) return res.status(400).json({ message: 'Email address required' });
@@ -313,7 +339,7 @@ app.post('/api/email/back-in-stock', async (req, res) => {
 });
 
 // Send abandoned cart reminder
-app.post('/api/email/abandoned-cart', async (req, res) => {
+app.post('/api/email/abandoned-cart', requireApiKey, async (req, res) => {
   try {
     const { to, items, total, customerName } = req.body;
     if (!to) return res.status(400).json({ message: 'Email address required' });
@@ -326,7 +352,7 @@ app.post('/api/email/abandoned-cart', async (req, res) => {
 });
 
 // ── Create subaccount (for organizers to receive payouts) ──
-app.post('/api/paystack/subaccount', async (req, res) => {
+app.post('/api/paystack/subaccount', requireApiKey, async (req, res) => {
   try {
     const { business_name, bank_code, account_number } = req.body;
 
