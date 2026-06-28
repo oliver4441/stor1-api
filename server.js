@@ -62,37 +62,114 @@ app.get('/', (req, res) => {
 });
 
 // ── Nia AI Chat Proxy ──────────────────────────────────────────────
+const NIA_SYSTEM_PROMPT = `You are Nia, the friendly AI assistant for Omix Store — an online marketplace based in Kericho, Kenya. You talk like a real Kenyan, simple and warm.
+
+## About Omix Store
+- **Location:** Kericho, Kenya
+- **Website:** https://omixsystems.store
+- **Support:** omixsystems@gmail.com | +254 768 213 649 | WhatsApp: +254 768 213 649
+- **Hours:** Monday to Saturday, 8 AM — 6 PM. Sunday closed.
+- **Payment:** M-Pesa via Paystack STK Push (secure, instant). Cash on delivery also available for selected areas.
+- **Buyer Protection:** If an item arrives damaged or not as described, contact us within 24 hours.
+
+## Delivery Information
+- **Free delivery** within Kericho and surrounding areas.
+- **Kericho CBD:** Same day delivery.
+- **Kericho town:** 1-2 days.
+- **Outside Kericho:** 2-3 days.
+
+## Return Policy
+- **Electronics:** 7 days if defective, with receipt.
+- **Clothing:** 3 days with tags and receipt.
+- **Shoes:** 3 days if unworn.
+- **Furniture:** No returns — inspect on delivery.
+
+## Store Features
+- **Browse & Search:** All products on home page, search bar to find items.
+- **Wishlist:** Tap heart icon to save items. View at /wishlist.
+- **Promo Codes:** Enter at checkout for discounts.
+- **Order Tracking:** Track at /track-order or in Account page.
+- **Referral Program:** Unique referral link in Account. Both get KES 100 off.
+- **Loyalty Points:** 1 point per KES 100 spent. 100 points = KES 50 off.
+- **PWA Install:** Customers can install the app from browser.
+
+## How to Respond
+- Answer warmly and helpfully. Use simple Kenyan English. "Sawa", "pole", "asante" naturally.
+- Cannot see personal data. Direct users to Account page or support.
+- If confused: offer simple next step.
+- If angry: "Pole sana for the trouble. Let me help sort this out." Never argue.
+- If off-topic: politely redirect to Omix Store.
+- If unsure: "I don't have that info right now. Let me connect you to support." Then give email/WhatsApp.
+- Never make up prices, stock, or product details.
+- Always protect user privacy.
+
+## CHIPS FORMAT
+Every response must end with a line containing only:
+CHIPS: <chip1> | <chip2> | <chip3>
+
+Choose 2-4 chips. Default: Browse products | Track my order | Contact support`;
+
+// Free model list with fallbacks
+const NIA_MODELS = [
+  'opencode/deepseek-v4-flash-free',
+  'opencode/mimo-v2.5-free',
+  'opencode/qwen3.6-plus-free',
+  'opencode/minimax-m3-free',
+  'opencode/nemotron-3-ultra-free',
+  'opencode/north-mini-code-free',
+];
+
 app.post('/api/nia/chat', async (req, res) => {
-  const apiKey = process.env.VITE_OPENCODE_API_KEY;
+  const apiKey = process.env.OPENCODE_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'AI service not configured' });
 
-  const { messages, model = 'mimo-v2.5-free' } = req.body;
+  const { messages } = req.body;
   if (!messages || !Array.isArray(messages)) return res.status(400).json({ error: 'Messages required' });
 
-  try {
-    const resp = await fetch('https://opencode.ai/zen/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: 'system', content: 'You are Nia, the Omix Store assistant in Kericho, Kenya. Help with products, orders, M-Pesa payments (Paystack STK Push), delivery. Be concise (under 80 words). Never make up info. Offer human support (omixsystems@gmail.com / +254 768 213 649) if unsure.' },
-          ...messages,
-        ],
-        max_tokens: 500,
-        temperature: 0.7,
-        reasoning_effort: 'none',
-      }),
-    });
-    if (!resp.ok) return res.status(502).json({ error: 'AI service error' });
-    const data = await resp.json();
-    const content = data?.choices?.[0]?.message?.content?.trim() || null;
-    if (!content) return res.status(502).json({ error: 'Empty AI response' });
-    res.json({ content });
-  } catch (err) {
-    console.error('[Nia]', err.message);
-    res.status(500).json({ error: 'Server error' });
+  // Try each model in order until one works
+  for (const model of NIA_MODELS) {
+    try {
+      const resp = await fetch('https://api.opencode.ai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+          'User-Agent': 'OmixStore-Nia/1.0',
+          'HTTP-Referer': 'https://omixsystems.store',
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: 'system', content: NIA_SYSTEM_PROMPT },
+            ...messages,
+          ],
+          max_tokens: 500,
+          temperature: 0.7,
+        }),
+      });
+
+      if (!resp.ok) {
+        console.warn(`[Nia] Model ${model} returned ${resp.status}, trying next...`);
+        continue;
+      }
+
+      const data = await resp.json();
+      const content = data?.choices?.[0]?.message?.content?.trim() || null;
+      if (!content) {
+        console.warn(`[Nia] Model ${model} returned empty, trying next...`);
+        continue;
+      }
+
+      console.log(`[Nia] Responded via ${model}`);
+      res.json({ content });
+      return;
+    } catch (err) {
+      console.warn(`[Nia] Model ${model} error: ${err.message}, trying next...`);
+    }
   }
+
+  // All models failed
+  res.status(502).json({ error: 'All AI models unavailable. Please try again.' });
 });
 
 // ── Initialize Paystack Inline Payment ─────────────────────────────────────────
@@ -506,6 +583,28 @@ app.post('/api/push/send', requireApiKey, async (req, res) => {
   } catch (err) {
     console.error('Push send error:', err);
     res.status(500).json({ message: 'Failed to send push notifications', error: err.message });
+  }
+});
+
+// ── Admin SQL endpoint (temporary — delete after migrations applied) ──
+app.post('/api/admin/sql', requireApiKey, async (req, res) => {
+  if (!supabase) return res.status(500).json({ message: 'Supabase not configured' });
+  const { query } = req.body;
+  if (!query || typeof query !== 'string') return res.status(400).json({ message: 'query required' });
+  
+  // Only allow DDL statements (CREATE POLICY, ALTER TABLE, DROP POLICY)
+  const allowed = /^(CREATE\s+POLICY|ALTER\s+TABLE|DROP\s+POLICY|GRANT|REVOKE)/i.test(query.trim());
+  if (!allowed) return res.status(403).json({ message: 'Only DDL statements allowed' });
+
+  try {
+    const { data, error } = await supabase.rpc('exec_sql', { sql: query });
+    if (error) {
+      // If exec_sql doesn't exist, try using the Supabase Management API instead
+      return res.status(500).json({ message: 'RPC not available', error: error.message });
+    }
+    res.json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ message: 'SQL execution failed', error: err.message });
   }
 });
 
