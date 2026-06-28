@@ -109,14 +109,13 @@ CHIPS: <chip1> | <chip2> | <chip3>
 
 Choose 2-4 chips. Default: Browse products | Track my order | Contact support`;
 
-// Free model list with fallbacks
+// Free model list with fallbacks (verified working order)
+// nemotron-3-ultra-free and north-mini-code-free produce actual content reliably
+// deepseek-v4-flash-free is a reasoning model (content is empty, only reasoning_content exists)
 const NIA_MODELS = [
-  'opencode/deepseek-v4-flash-free',
-  'opencode/mimo-v2.5-free',
-  'opencode/qwen3.6-plus-free',
-  'opencode/minimax-m3-free',
-  'opencode/nemotron-3-ultra-free',
-  'opencode/north-mini-code-free',
+  'nemotron-3-ultra-free',
+  'north-mini-code-free',
+  'deepseek-v4-flash-free',
 ];
 
 app.post('/api/nia/chat', async (req, res) => {
@@ -129,7 +128,7 @@ app.post('/api/nia/chat', async (req, res) => {
   // Try each model in order until one works
   for (const model of NIA_MODELS) {
     try {
-      const resp = await fetch('https://api.opencode.ai/v1/chat/completions', {
+      const resp = await fetch('https://opencode.ai/zen/v1/chat/completions', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -154,7 +153,13 @@ app.post('/api/nia/chat', async (req, res) => {
       }
 
       const data = await resp.json();
-      const content = data?.choices?.[0]?.message?.content?.trim() || null;
+      const msg = data?.choices?.[0]?.message || {};
+      // Some models (like deepseek-v4-flash-free) put reasoning in reasoning_content
+      // and leave content empty — fall back to reasoning_content if content is blank
+      let content = msg?.content?.trim();
+      if (!content && msg?.reasoning_content) {
+        content = msg.reasoning_content.trim();
+      }
       if (!content) {
         console.warn(`[Nia] Model ${model} returned empty, trying next...`);
         continue;
@@ -304,11 +309,66 @@ app.post('/api/paystack/webhook', express.raw({ type: 'application/json' }), asy
             .single();
 
           if (existing && existing.status !== 'paid') {
-            // Fetch order items for email
+            // Fetch order items for email and stock tracking
             const { data: orderItems } = await supabase
               .from('omix_order_items')
-              .select('product_name, price, quantity, variant')
+              .select('product_id, product_name, price, quantity, variant')
               .eq('order_id', metadata.order_id);
+
+            // ── Stock Tracking: Decrement quantity & update status ──
+            if (orderItems && orderItems.length > 0) {
+              for (const item of orderItems) {
+                if (!item.product_id) continue;
+                try {
+                  // Fetch current stock
+                  const { data: product } = await supabase
+                    .from('omix_listings')
+                    .select('stock_quantity, quantity, status, purchase_count')
+                    .eq('id', item.product_id)
+                    .single();
+
+                  if (product) {
+                    // Determine stock field (some tables use stock_quantity, some use quantity)
+                    const currentStock = product.stock_quantity ?? product.quantity ?? 0;
+                    const newStock = Math.max(0, currentStock - item.quantity);
+                    const currentPurchaseCount = product.purchase_count ?? 0;
+
+                    // Determine new status
+                    let newStatus = product.status;
+                    if (newStock <= 0) {
+                      newStatus = 'sold';
+                    }
+
+                    // Update stock, purchase_count, and status
+                    const updateFields = {
+                      status: newStatus,
+                      purchase_count: currentPurchaseCount + item.quantity,
+                      updated_at: new Date().toISOString(),
+                    };
+                    // Update whichever stock field exists
+                    if (product.stock_quantity !== undefined) {
+                      updateFields.stock_quantity = newStock;
+                    }
+                    if (product.quantity !== undefined) {
+                      updateFields.quantity = newStock;
+                    }
+                    // Auto-featured if purchase_count > 5
+                    if (currentPurchaseCount + item.quantity > 5) {
+                      updateFields.featured = true;
+                    }
+
+                    await supabase
+                      .from('omix_listings')
+                      .update(updateFields)
+                      .eq('id', item.product_id);
+
+                    console.log(`[Stock] Product ${item.product_id}: ${currentStock} → ${newStock}, status: ${newStatus}, purchases: ${currentPurchaseCount + item.quantity}`);
+                  }
+                } catch (stockErr) {
+                  console.error(`[Stock] Failed to update stock for product ${item.product_id}:`, stockErr.message);
+                }
+              }
+            }
 
             await supabase
               .from('omix_orders')
@@ -605,6 +665,157 @@ app.post('/api/admin/sql', requireApiKey, async (req, res) => {
     res.json({ success: true, data });
   } catch (err) {
     res.status(500).json({ message: 'SQL execution failed', error: err.message });
+  }
+});
+
+// ── Admin Analytics Endpoint ──────────────────────────────────
+app.get('/api/admin/analytics', requireApiKey, async (req, res) => {
+  if (!supabase) return res.status(500).json({ message: 'Supabase not configured' });
+
+  try {
+    const { period = '30' } = req.query; // days
+    const days = parseInt(period, 10) || 30;
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - days);
+    const cutoffISO = cutoff.toISOString();
+
+    // Fetch orders in period
+    const { data: orders, error: ordersErr } = await supabase
+      .from('omix_orders')
+      .select('id, total_amount, status, created_at, omix_order_items(product_id, product_name, price, quantity)')
+      .gte('created_at', cutoffISO)
+      .order('created_at', { ascending: false });
+
+    if (ordersErr) return res.status(500).json({ message: ordersErr.message });
+
+    // Paid orders only for revenue
+    const paidOrders = (orders || []).filter(o => o.status === 'paid');
+    const totalRevenue = paidOrders.reduce((sum, o) => sum + parseFloat(o.total_amount || 0), 0);
+    const totalOrders = paidOrders.length;
+
+    // Revenue by day
+    const revenueByDay = {};
+    const ordersByDay = {};
+    const uniqueVisitorsByDay = {};
+
+    paidOrders.forEach(o => {
+      const day = new Date(o.created_at).toISOString().split('T')[0];
+      revenueByDay[day] = (revenueByDay[day] || 0) + parseFloat(o.total_amount || 0);
+      ordersByDay[day] = (ordersByDay[day] || 0) + 1;
+      // Approximate unique visitors by counting unique order emails per day
+      const email = o.email || 'unknown';
+      if (!uniqueVisitorsByDay[day]) uniqueVisitorsByDay[day] = new Set();
+      uniqueVisitorsByDay[day].add(email);
+    });
+
+    // Build daily chart data
+    const dailyData = [];
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      const key = d.toISOString().split('T')[0];
+      dailyData.push({
+        date: d.toLocaleDateString('en-KE', { month: 'short', day: 'numeric' }),
+        revenue: Math.round(revenueByDay[key] || 0),
+        orders: ordersByDay[key] || 0,
+        users: uniqueVisitorsByDay[key] ? uniqueVisitorsByDay[key].size : 0,
+      });
+    }
+
+    // Weekly aggregation (if period >= 7)
+    const weeklyData = [];
+    if (days >= 7) {
+      for (let i = 0; i < dailyData.length; i += 7) {
+        const week = dailyData.slice(i, i + 7);
+        weeklyData.push({
+          date: week[0]?.date || '',
+          revenue: week.reduce((s, d) => s + d.revenue, 0),
+          orders: week.reduce((s, d) => s + d.orders, 0),
+          users: week.reduce((s, d) => s + d.users, 0),
+        });
+      }
+    }
+
+    // Monthly aggregation (if period >= 30)
+    const monthlyData = [];
+    if (days >= 30) {
+      const monthMap = {};
+      dailyData.forEach(d => {
+        // Parse the date label back to group by month
+        const monthKey = d.date.split(' ')[0]; // e.g. "Jun"
+        if (!monthMap[monthKey]) monthMap[monthKey] = { date: monthKey, revenue: 0, orders: 0, users: 0 };
+        monthMap[monthKey].revenue += d.revenue;
+        monthMap[monthKey].orders += d.orders;
+        monthMap[monthKey].users += d.users;
+      });
+      monthlyData.push(...Object.values(monthMap));
+    }
+
+    // Top selling products
+    const productSales = {};
+    paidOrders.forEach(order => {
+      (order.omix_order_items || []).forEach(item => {
+        const id = item.product_id || item.product_name;
+        if (!productSales[id]) {
+          productSales[id] = {
+            product_id: item.product_id,
+            name: item.product_name,
+            quantitySold: 0,
+            revenue: 0,
+          };
+        }
+        productSales[id].quantitySold += item.quantity || 1;
+        productSales[id].revenue += (item.price || 0) * (item.quantity || 1);
+      });
+    });
+
+    const topProducts = Object.values(productSales)
+      .sort((a, b) => b.revenue - a.revenue)
+      .slice(0, 10);
+
+    // Order status breakdown
+    const statusBreakdown = {};
+    (orders || []).forEach(o => {
+      statusBreakdown[o.status] = (statusBreakdown[o.status] || 0) + 1;
+    });
+
+    // Conversion rate: paid orders / total sessions (approximated by total orders)
+    const totalAllOrders = (orders || []).length;
+    const conversionRate = totalAllOrders > 0
+      ? ((totalOrders / totalAllOrders) * 100).toFixed(1)
+      : '0.0';
+
+    // App usage metrics
+    const { data: totalListings } = await supabase
+      .from('omix_listings')
+      .select('id', { count: 'exact', head: true });
+
+    const { data: totalUsers } = await supabase
+      .from('profiles')
+      .select('id', { count: 'exact', head: true });
+
+    res.json({
+      period: days,
+      summary: {
+        totalRevenue: Math.round(totalRevenue),
+        totalOrders,
+        totalAllOrders,
+        avgOrderValue: totalOrders > 0 ? Math.round(totalRevenue / totalOrders) : 0,
+        conversionRate: parseFloat(conversionRate),
+        totalListings: totalListings?.length || 0,
+        totalUsers: totalUsers?.length || 0,
+      },
+      statusBreakdown,
+      topProducts,
+      charts: {
+        daily: dailyData,
+        weekly: weeklyData,
+        monthly: monthlyData,
+      },
+    });
+  } catch (err) {
+    console.error('[Analytics] Error:', err);
+    res.status(500).json({ message: 'Analytics fetch failed', error: err.message });
   }
 });
 
