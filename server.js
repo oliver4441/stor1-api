@@ -435,6 +435,80 @@ app.post('/api/paystack/subaccount', requireApiKey, async (req, res) => {
   }
 });
 
+// ── Push Notifications ──
+// Receives subscriptions + payload from admin, sends web push via service role
+app.post('/api/push/send', requireApiKey, async (req, res) => {
+  try {
+    const { subscriptions, payload } = req.body;
+
+    if (!subscriptions || !Array.isArray(subscriptions) || subscriptions.length === 0) {
+      return res.json({ sent: 0, failed: 0, message: 'No subscriptions' });
+    }
+
+    if (!supabase) {
+      return res.status(500).json({ error: 'Supabase not configured' });
+    }
+
+    // Optionally fetch fresh subscriptions from DB if not provided
+    let subs = subscriptions;
+    if (subs.length === 0) {
+      const { data, error } = await supabase
+        .from('push_subscriptions')
+        .select('endpoint, p256dh_key, auth_key');
+      if (error) return res.status(500).json({ error: 'Failed to fetch subscriptions' });
+      subs = data || [];
+    }
+
+    let sent = 0;
+    let failed = 0;
+
+    for (const sub of subs) {
+      try {
+        const pushPayload = JSON.stringify({
+          title: payload?.title || 'Omix Store',
+          body: payload?.body || '',
+          icon: payload?.icon || '/logo192.png',
+          badge: '/logo192.png',
+          tag: payload?.tag || 'omix-broadcast',
+          data: { url: payload?.url || '/' },
+          image: payload?.image || undefined,
+          actions: payload?.actions || [],
+          requireInteraction: payload?.requireInteraction || false,
+        });
+
+        const response = await fetch(sub.endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'TTL': '86400',
+          },
+          body: pushPayload,
+        });
+
+        if (response.ok || response.status === 201) {
+          sent++;
+        } else if (response.status === 410 || response.status === 404) {
+          // Subscription expired — delete from DB
+          failed++;
+          await supabase
+            .from('push_subscriptions')
+            .delete()
+            .eq('endpoint', sub.endpoint);
+        } else {
+          failed++;
+        }
+      } catch {
+        failed++;
+      }
+    }
+
+    res.json({ sent, failed, total: subs.length });
+  } catch (err) {
+    console.error('Push send error:', err);
+    res.status(500).json({ message: 'Failed to send push notifications', error: err.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 Omix API server running on port ${PORT}`);
   console.log(`   Paystack: ${PAYSTACK_SECRET?.startsWith('sk_live') ? 'PRODUCTION' : 'TEST'}`);
