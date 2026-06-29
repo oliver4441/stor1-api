@@ -134,14 +134,14 @@ app.post('/api/nia/chat', async (req, res) => {
 
     if (isProductQuery && supabase) {
       const searchTerms = lastUserMsg.replace(/^(show|find|search|look|get|i want|i need|do you have|any|recommend|suggest|what|where|do you sell|list of)\s*/i, '').trim();
-      let query = supabase.from('products').select('title,price,category,condition').eq('status', 'active').order('created_at', { ascending: false }).limit(6);
+      let query = supabase.from('listings').select('title,price,condition').eq('status', 'active').order('created_at', { ascending: false }).limit(6);
       if (searchTerms.length > 2) {
-        query = query.or(`title.ilike.*${searchTerms}*,category.ilike.*${searchTerms}*`);
+        query = query.ilike('title', `%${searchTerms}%`);
       }
       const { data: products } = await query;
       if (products?.length) {
-        contextPrompt += '\n\n## Available Products:\n' + products.map(p =>
-          `- ${p.title}: KES ${p.price.toLocaleString()}${p.category ? ` (${p.category}, ${p.condition || 'used'})` : ''}`
+        contextPrompt += '\n## Available Products:\n' + products.map(p =>
+          `- ${p.title}: KES ${p.price.toLocaleString()}${p.condition ? ` (${p.condition})` : ''}`
         ).join('\n');
         contextPrompt += '\n\nRecommend these products if relevant. Include prices.';
       }
