@@ -102,7 +102,7 @@ const NIA_SYSTEM_PROMPT = `You are Nia, the friendly AI assistant for Omix Store
 - If unsure: "I don't have that info right now. Let me connect you to support." Then give email/WhatsApp.
 - Never make up prices, stock, or product details.
 - Always protect user privacy.
-- IMPORTANT: Never use markdown symbols in your responses. NO asterisks (*), no hash symbols (#), no underscores (_), no backticks (`). Write plain text only. Use dashes (-) for lists if needed.
+- IMPORTANT: Never use markdown symbols in your responses. NO asterisks (*), no hash symbols (#), no underscores (_), no backticks. Write plain text only. Use dashes (-) for lists if needed.
 
 ## CHIPS FORMAT
 Every response must end with a line containing only:
