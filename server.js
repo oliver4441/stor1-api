@@ -862,13 +862,36 @@ app.get('/api/admin/analytics', requireApiKey, async (req, res) => {
       .sort((a, b) => b.revenue - a.revenue)
       .slice(0, 10);
 
+    // COD (Cash on Delivery) tracking
+    const codOrders = (orders || []).filter(o => o.status === 'cod_pending' || o.payment_method === 'cod');
+    const codRevenue = codOrders.reduce((sum, o) => sum + parseFloat(o.total_amount || 0), 0);
+    const codProductSales = {};
+    codOrders.forEach(order => {
+      (order.omix_order_items || []).forEach(item => {
+        const id = item.product_id || item.product_name;
+        if (!codProductSales[id]) {
+          codProductSales[id] = {
+            product_id: item.product_id,
+            name: item.product_name,
+            quantitySold: 0,
+            revenue: 0,
+          };
+        }
+        codProductSales[id].quantitySold += item.quantity || 1;
+        codProductSales[id].revenue += (item.price || 0) * (item.quantity || 1);
+      });
+    });
+    const codTopProducts = Object.values(codProductSales)
+      .sort((a, b) => b.revenue - a.revenue)
+      .slice(0, 10);
+
     // Order status breakdown
     const statusBreakdown = {};
     (orders || []).forEach(o => {
       statusBreakdown[o.status] = (statusBreakdown[o.status] || 0) + 1;
     });
 
-    // Conversion rate: paid orders / total sessions (approximated by total orders)
+    // Conversion rate: paid orders /ximated by total orders)
     const totalAllOrders = (orders || []).length;
     const conversionRate = totalAllOrders > 0
       ? ((totalOrders / totalAllOrders) * 100).toFixed(1)
@@ -893,6 +916,11 @@ app.get('/api/admin/analytics', requireApiKey, async (req, res) => {
         conversionRate: parseFloat(conversionRate),
         totalListings: totalListings?.length || 0,
         totalUsers: totalUsers?.length || 0,
+      },
+      cod: {
+        totalOrders: codOrders.length,
+        totalCashAmount: Math.round(codRevenue),
+        topProducts: codTopProducts,
       },
       statusBreakdown,
       topProducts,
