@@ -127,6 +127,7 @@ app.post('/api/nia/chat', async (req, res) => {
 
   // Build dynamic context
   let contextPrompt = NIA_SYSTEM_PROMPT;
+  console.log(`[Nia] chat request: supabase=${supabase ? 'OK' : 'NULL'}, msgCount=${messages.length}`);
   try {
     // Detect product queries and fetch matching products
     const lastUserMsg = messages.filter(m => m.role === 'user').pop()?.content?.toLowerCase() || '';
