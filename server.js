@@ -122,8 +122,57 @@ app.post('/api/nia/chat', async (req, res) => {
   const apiKey = process.env.OPENCODE_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'AI service not configured' });
 
-  const { messages } = req.body;
+  const { messages, userId } = req.body;
   if (!messages || !Array.isArray(messages)) return res.status(400).json({ error: 'Messages required' });
+
+  // Build dynamic context
+  let contextPrompt = NIA_SYSTEM_PROMPT;
+  try {
+    // Detect product queries and fetch matching products
+    const lastUserMsg = messages.filter(m => m.role === 'user').pop()?.content?.toLowerCase() || '';
+    const isProductQuery = /product|item|buy|shop|find|search|price|cost|available|stock|recommend|suggest|show|do you have|gatsby|phone|laptop|tablets?|tv|headphone|charger|cable|airpod/i.test(lastUserMsg);
+
+    if (isProductQuery && supabase) {
+      const searchTerms = lastUserMsg.replace(/^(show|find|search|look|get|i want|i need|do you have|any|recommend|suggest|what|where|do you sell|list of)\s*/i, '').trim();
+      let query = supabase.from('products').select('title,price,category,condition').eq('status', 'active').order('created_at', { ascending: false }).limit(6);
+      if (searchTerms.length > 2) {
+        query = query.or(`title.ilike.*${searchTerms}*,category.ilike.*${searchTerms}*`);
+      }
+      const { data: products } = await query;
+      if (products?.length) {
+        contextPrompt += '\n\n## Available Products:\n' + products.map(p =>
+          `- ${p.title}: KES ${p.price.toLocaleString()}${p.category ? ` (${p.category}, ${p.condition || 'used'})` : ''}`
+        ).join('\n');
+        contextPrompt += '\n\nRecommend these products if relevant. Include prices.';
+      }
+    }
+
+    // Add user context if available
+    if (userId && supabase) {
+      const { data: profile } = await supabase.from('profiles').select('full_name,loyalty_points,referral_code').eq('id', userId).single();
+      if (profile) {
+        contextPrompt += `\n\n## Current User:\n- Name: ${profile.full_name || 'Customer'}\n- Loyalty Points: ${profile.loyalty_points || 0}`;
+        if (profile.referral_code) contextPrompt += `\n- Referral Code: ${profile.referral_code}`;
+      }
+
+      const { data: orders } = await supabase.from('omix_orders').select('id,status,total_amount,created_at').eq('user_id', userId).order('created_at', { ascending: false }).limit(3);
+      if (orders?.length) {
+        contextPrompt += '\n\n## Recent Orders:\n' + orders.map(o =>
+          `- Order #${o.id.toString().slice(0, 8).toUpperCase()}: ${o.status} — KES ${o.total_amount?.toLocaleString() || '?'} (${new Date(o.created_at).toLocaleDateString('en-KE')})`
+        ).join('\n');
+        contextPrompt += '\n\nReference these orders if user asks about them.';
+      }
+    }
+  } catch (ctxErr) {
+    console.warn('[Nia] Context fetch failed, using baseline prompt:', ctxErr.message);
+  }
+
+  // Detect Swahili
+  const lastMsg = messages.filter(m => m.role === 'user').pop()?.content?.toLowerCase() || '';
+  const isSwahili = /jambo|habari|naomba|nataka|bei|pesa|shilingi|asante|ndio|hapana|nini|wapi|vipi|ngapi|saa|oda|malipo|usafirishaji/i.test(lastMsg);
+  if (isSwahili) {
+    contextPrompt += '\n\n⚠️ User is speaking Swahili. Respond in natural, conversational Swahili (Kiswahili).';
+  }
 
   // Try each model in order until one works
   for (const model of NIA_MODELS) {
@@ -139,10 +188,10 @@ app.post('/api/nia/chat', async (req, res) => {
         body: JSON.stringify({
           model,
           messages: [
-            { role: 'system', content: NIA_SYSTEM_PROMPT },
+            { role: 'system', content: contextPrompt },
             ...messages,
           ],
-          max_tokens: 500,
+          max_tokens: 600,
           temperature: 0.7,
         }),
       });
@@ -154,8 +203,7 @@ app.post('/api/nia/chat', async (req, res) => {
 
       const data = await resp.json();
       const msg = data?.choices?.[0]?.message || {};
-      // Some models (like deepseek-v4-flash-free) put reasoning in reasoning_content
-      // and leave content empty — fall back to reasoning_content if content is blank
+      // Some models put reasoning in reasoning_content and leave content empty
       let content = msg?.content?.trim();
       if (!content && msg?.reasoning_content) {
         content = msg.reasoning_content.trim();
