@@ -102,6 +102,7 @@ const NIA_SYSTEM_PROMPT = `You are Nia, the friendly AI assistant for Omix Store
 - If unsure: "I don't have that info right now. Let me connect you to support." Then give email/WhatsApp.
 - Never make up prices, stock, or product details.
 - Always protect user privacy.
+- IMPORTANT: Never use markdown symbols in your responses. NO asterisks (*), no hash symbols (#), no underscores (_), no backticks (`). Write plain text only. Use dashes (-) for lists if needed.
 
 ## CHIPS FORMAT
 Every response must end with a line containing only:
@@ -122,12 +123,12 @@ app.post('/api/nia/chat', async (req, res) => {
   const apiKey = process.env.OPENCODE_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'AI service not configured' });
 
-  const { messages, userId } = req.body;
+  const { messages, userId, pageContext, cartItems } = req.body;
   if (!messages || !Array.isArray(messages)) return res.status(400).json({ error: 'Messages required' });
 
   // Build dynamic context
   let contextPrompt = NIA_SYSTEM_PROMPT;
-  console.log(`[Nia] chat request: supabase=${supabase ? 'OK' : 'NULL'}, msgCount=${messages.length}`);
+  console.log(`[Nia] chat request: supabase=${supabase ? 'OK' : 'NULL'}, msgCount=${messages.length}, page=${pageContext || 'none'}`);
   try {
     // Detect product queries and fetch matching products
     const lastUserMsg = messages.filter(m => m.role === 'user').pop()?.content?.toLowerCase() || '';
@@ -149,12 +150,47 @@ app.post('/api/nia/chat', async (req, res) => {
       }
     }
 
+    // Add page context if provided
+    if (pageContext) {
+      contextPrompt += `\n\n## Current Page Context:\nUser is browsing: ${pageContext}`;
+      contextPrompt += '\n\nUse this context to give relevant answers. If they ask "how much is this" or "what do you think", refer to what they are looking at.';
+    }
+
+    // Add cart context if provided
+    if (cartItems && cartItems.length > 0) {
+      const cartTotal = cartItems.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+      contextPrompt += `\n\n## User's Cart (${cartItems.length} items, KES ${cartTotal.toLocaleString()} total):\n`;
+      contextPrompt += cartItems.map(c => `- ${c.name || c.title} x${c.quantity} @ KES ${c.price?.toLocaleString() || '?'}`).join('\n');
+      contextPrompt += '\n\nReference the cart if user asks about it, total, or checkout.';
+    }
+
     // Add user context if available
     if (userId && supabase) {
       const { data: profile } = await supabase.from('profiles').select('full_name,loyalty_points,referral_code').eq('id', userId).single();
       if (profile) {
         contextPrompt += `\n\n## Current User:\n- Name: ${profile.full_name || 'Customer'}\n- Loyalty Points: ${profile.loyalty_points || 0}`;
         if (profile.referral_code) contextPrompt += `\n- Referral Code: ${profile.referral_code}`;
+      }
+
+      // Check if user is asking about a specific order by ID
+      const orderIdMatch = lastUserMsg.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i)
+        || lastUserMsg.match(/[0-9a-f]{8}/i);
+
+      if (orderIdMatch && /order|track|status|where/i.test(lastUserMsg)) {
+        // Try to find order by full or partial ID
+        const { data: specificOrder } = await supabase
+          .from('omix_orders')
+          .select('id,status,total_amount,customer_name,created_at,omix_order_items(product_name,quantity,price)')
+          .eq('user_id', userId)
+          .ilike('id', `${orderIdMatch[0]}%`)
+          .single();
+        if (specificOrder) {
+          contextPrompt += `\n\n## Order Lookup Result:\nOrder #${specificOrder.id.slice(0,8).toUpperCase()}: ${specificOrder.status} — KES ${specificOrder.total_amount?.toLocaleString() || '?'} (${new Date(specificOrder.created_at).toLocaleDateString('en-KE')})`;
+          if (specificOrder.omix_order_items?.length) {
+            contextPrompt += '\nItems:' + specificOrder.omix_order_items.map(i => `\n- ${i.product_name} x${i.quantity}`).join('');
+          }
+          contextPrompt += '\n\nShare this order status with the user in a friendly way.';
+        }
       }
 
       const { data: orders } = await supabase.from('omix_orders').select('id,status,total_amount,created_at').eq('user_id', userId).order('created_at', { ascending: false }).limit(3);
@@ -214,6 +250,9 @@ app.post('/api/nia/chat', async (req, res) => {
         console.warn(`[Nia] Model ${model} returned empty, trying next...`);
         continue;
       }
+
+      // Strip any markdown symbols that leaked through
+      content = content.replace(/\*/g, '').replace(/#{1,6}\s?/g, '').replace(/_{2,}/g, '').replace(/`/g, '').trim();
 
       console.log(`[Nia] Responded via ${model}`);
       res.json({ content });
