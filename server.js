@@ -8,6 +8,7 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import fetch from 'node-fetch';
+import webpush from 'web-push';
 import { createClient } from '@supabase/supabase-js';
 import email from './lib/email.js';
 
@@ -28,6 +29,20 @@ const PAYSTACK_PUBLIC = process.env.PAYSTACK_PUBLIC_KEY;
 const OMIX_SUBACCOUNT_CODE = process.env.OMIX_SUBACCOUNT_CODE;
 const PORT = process.env.PORT || 3001;
 
+// VAPID keys for web push
+const VAPID_PUBLIC_KEY = process.env.VITE_VAPID_PUBLIC_KEY || process.env.VAPID_PUBLIC_KEY || '';
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
+if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+  webpush.setVapidDetails(
+    'mailto:admin@omix.store',
+    VAPID_PUBLIC_KEY,
+    VAPID_PRIVATE_KEY
+  );
+  console.log('[Push] VAPID configured, public key:', VAPID_PUBLIC_KEY.substring(0, 20) + '...');
+} else {
+  console.warn('[Push] VAPID keys not set — push sending disabled');
+}
+
 // Supabase client for maintenance mode checks
 let supabase = null;
 if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
@@ -41,6 +56,51 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
     supabase = null;
   }
 }
+
+// ── Startup Migration: ensure payment_method column exists ──
+// Uses a raw fetch against the Supabase Management API on the same project
+(async function runMigration() {
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) return;
+  try {
+    // Try ALTER TABLE via Supabase SQL REST endpoint (service_role bypasses RLS)
+    const sqlUrl = process.env.SUPABASE_URL.replace(/\/$/, '') + '/rest/v1/rpc/';
+    const response = await fetch(sqlUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey': process.env.SUPABASE_SERVICE_KEY,
+        'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_KEY}`,
+        'Prefer': 'params=single-object',
+      },
+      body: JSON.stringify({
+        sql: `ALTER TABLE omix_orders ADD COLUMN IF NOT EXISTS payment_method text DEFAULT 'pending';`
+      })
+    });
+    if (response.ok) {
+      console.log('[Migration] payment_method column added/confirmed ✅');
+    } else {
+      console.warn('[Migration] Could not add column via REST, trying management API...');
+      // Fallback: try with the project ref from URL
+      const projectRef = process.env.SUPABASE_URL?.match(/https:\/\/([^.]+)/)?.[1];
+      if (projectRef) {
+        const mgmtRes = await fetch(`https://api.supabase.com/v1/projects/${projectRef}/database/query`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_KEY}`,
+          },
+          body: JSON.stringify({
+            query: `ALTER TABLE omix_orders ADD COLUMN IF NOT EXISTS payment_method text DEFAULT 'pending';`
+          })
+        });
+        if (mgmtRes.ok) console.log('[Migration] payment_method column added via mgmt API ✅');
+        else console.warn('[Migration] Management API also failed:', await mgmtRes.text().catch(() => ''));
+      }
+    }
+  } catch (err) {
+    console.warn('[Migration] Startup migration error (non-fatal):', err.message);
+  }
+})();
 
 if (!PAYSTACK_SECRET) {
   console.error('PAYSTACK_SECRET_KEY not set!');
@@ -690,6 +750,14 @@ app.post('/api/push/send', requireApiKey, async (req, res) => {
 
     for (const sub of subs) {
       try {
+        const subscription = {
+          endpoint: sub.endpoint,
+          keys: {
+            p256dh: sub.p256dh_key,
+            auth: sub.auth_key,
+          },
+        };
+
         const pushPayload = JSON.stringify({
           title: payload?.title || 'Omix Store',
           body: payload?.body || '',
@@ -702,18 +770,10 @@ app.post('/api/push/send', requireApiKey, async (req, res) => {
           requireInteraction: payload?.requireInteraction || false,
         });
 
-        const response = await fetch(sub.endpoint, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/octet-stream',
-            'TTL': '86400',
-          },
-          body: pushPayload,
-        });
-
-        if (response.ok || response.status === 201) {
-          sent++;
-        } else if (response.status === 410 || response.status === 404) {
+        await webpush.sendNotification(subscription, pushPayload);
+        sent++;
+      } catch (err) {
+        if (err.statusCode === 410 || err.statusCode === 404) {
           // Subscription expired — delete from DB
           failed++;
           await supabase
@@ -722,9 +782,8 @@ app.post('/api/push/send', requireApiKey, async (req, res) => {
             .eq('endpoint', sub.endpoint);
         } else {
           failed++;
+          console.warn('[Push] send failed:', err.message);
         }
-      } catch {
-        failed++;
       }
     }
 
