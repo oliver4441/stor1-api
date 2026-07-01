@@ -995,6 +995,348 @@ app.get('/api/admin/analytics', requireApiKey, async (req, res) => {
   }
 });
 
+// ── Affiliate Program Admin Endpoints ────────────────────────────────
+
+// Helper: require admin role
+async function requireAdmin(req, res, next) {
+  if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+  try {
+    // Will check via API key + admin role
+    next();
+  } catch { res.status(401).json({ error: 'Unauthorized' }); }
+}
+
+// List all affiliates
+app.get('/api/admin/affiliates', requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('affiliates')
+      .select('*, profiles(full_name, email, role)')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json({ success: true, data: data || [] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Create affiliate
+app.post('/api/admin/affiliates', requireAdmin, async (req, res) => {
+  try {
+    const { full_name, email, phone, mpesa_number, password } = req.body;
+    if (!full_name || !email || !password) {
+      return res.status(400).json({ success: false, error: 'Full name, email, and password are required' });
+    }
+
+    // 1. Create auth user
+    const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+      email,
+      password,
+      email_confirm: true,
+      user_metadata: { full_name, role: 'affiliate' },
+    });
+    if (authError) throw new Error(authError.message);
+
+    const userId = authData.user.id;
+
+    // 2. Create profile with affiliate role
+    const genRefCode = userId.replace(/-/g, '').slice(0, 8).toUpperCase();
+    await supabase.from('profiles').upsert({
+      id: userId,
+      full_name,
+      email,
+      phone: phone || null,
+      role: 'affiliate',
+      referral_code: genRefCode,
+    });
+
+    // 3. Create affiliate record
+    const code = `AFF-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+    const { data: affiliate, error: affError } = await supabase
+      .from('affiliates')
+      .insert({
+        user_id: userId,
+        full_name,
+        email,
+        phone: phone || null,
+        mpesa_number: mpesa_number || null,
+        referral_code: code,
+        status: 'active',
+      })
+      .select()
+      .single();
+
+    if (affError) throw new Error(affError.message);
+
+    // 4. Log the creation
+    await supabase.from('affiliate_logs').insert({
+      affiliate_id: affiliate.id,
+      event_type: 'ACCOUNT_CREATED',
+      details: { full_name, email, created_by: 'admin' },
+    });
+
+    res.json({ success: true, affiliate, referral_code: code });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Update affiliate
+app.patch('/api/admin/affiliates/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updates = {};
+    if (req.body.full_name) updates.full_name = req.body.full_name;
+    if (req.body.phone) updates.phone = req.body.phone;
+    if (req.body.mpesa_number) updates.mpesa_number = req.body.mpesa_number;
+    if (req.body.status) updates.status = req.body.status;
+
+    const { data, error } = await supabase
+      .from('affiliates')
+      .update(updates)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    await supabase.from('affiliate_logs').insert({
+      affiliate_id: id,
+      event_type: 'AFFILIATE_UPDATED',
+      details: updates,
+    });
+
+    res.json({ success: true, affiliate: data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Calculate monthly commission for all affiliates
+// POST /api/admin/commissions/calculate?year=2026&month=6
+app.post('/api/admin/commissions/calculate', requireAdmin, async (req, res) => {
+  try {
+    const year = parseInt(req.query.year) || new Date().getFullYear();
+    const month = parseInt(req.query.month) || new Date().getMonth(); // 0-indexed
+
+    const monthStart = new Date(year, month, 1).toISOString();
+    const monthEnd = new Date(year, month + 1, 1).toISOString();
+
+    // Get all active affiliates
+    const { data: affiliates } = await supabase
+      .from('affiliates')
+      .select('*')
+      .eq('status', 'active');
+
+    if (!affiliates || affiliates.length === 0) {
+      return res.json({ success: true, message: 'No active affiliates', commissions: [] });
+    }
+
+    const commissions = [];
+
+    for (const affiliate of affiliates) {
+      // Get referred user IDs
+      const { data: referredUsers } = await supabase
+        .from('profiles')
+        .select('id')
+        .eq('referred_by', affiliate.id);
+
+      const userIds = (referredUsers || []).map(u => u.id);
+      if (userIds.length === 0) continue;
+
+      // Get qualified orders in this month
+      const { data: orders } = await supabase
+        .from('omix_orders')
+        .select('id, total_amount, status')
+        .in('user_id', userIds)
+        .gte('created_at', monthStart)
+        .lt('created_at', monthEnd)
+        .in('status', ['paid', 'completed', 'delivered']);
+
+      if (!orders || orders.length === 0) continue;
+
+      const totalSales = orders.reduce((sum, o) => sum + parseFloat(o.total_amount || 0), 0);
+      const orderCount = orders.length;
+
+      // Determine tier and rate
+      // Count total qualified sales in current year
+      const yearStart = new Date(year, 0, 1).toISOString();
+      const { data: yearOrders } = await supabase
+        .from('omix_orders')
+        .select('id')
+        .in('user_id', userIds)
+        .gte('created_at', yearStart)
+        .lt('created_at', monthEnd)
+        .in('status', ['paid', 'completed', 'delivered']);
+
+      const yearlyCount = (yearOrders || []).length;
+      const tier = yearlyCount >= 30 ? 'gold' : 'silver';
+      const rate = tier === 'gold' ? 0.10 : 0.05;
+      const commissionAmount = Math.round(totalSales * rate);
+
+      // Upsert commission record
+      const { data: existing } = await supabase
+        .from('monthly_commissions')
+        .select('id')
+        .eq('affiliate_id', affiliate.id)
+        .eq('year', year)
+        .eq('month', month + 1)
+        .single();
+
+      let commission;
+      if (existing) {
+        const { data: updated } = await supabase
+          .from('monthly_commissions')
+          .update({
+            total_sales: totalSales,
+            qualified_order_count: orderCount,
+            commission_rate: rate,
+            commission_amount: commissionAmount,
+          })
+          .eq('id', existing.id)
+          .select()
+          .single();
+        commission = updated;
+      } else {
+        const { data: inserted } = await supabase
+          .from('monthly_commissions')
+          .insert({
+            affiliate_id: affiliate.id,
+            year,
+            month: month + 1,
+            total_sales: totalSales,
+            qualified_order_count: orderCount,
+            commission_rate: rate,
+            commission_amount: commissionAmount,
+          })
+          .select()
+          .single();
+        commission = inserted;
+      }
+
+      // Store individual order details for audit
+      const orderDetails = orders.map(o => ({
+        commission_id: commission.id,
+        order_id: o.id,
+        order_amount: o.total_amount,
+      }));
+
+      if (orderDetails.length > 0) {
+        // Clear previous order links, then insert fresh
+        await supabase.from('commission_order_details').delete().eq('commission_id', commission.id);
+        await supabase.from('commission_order_details').insert(orderDetails);
+      }
+
+      // Log the calculation
+      await supabase.from('affiliate_logs').insert({
+        affiliate_id: affiliate.id,
+        event_type: 'COMMISSION_CALCULATED',
+        details: { year, month: month + 1, totalSales, orderCount, rate, commissionAmount },
+      });
+
+      commissions.push(commission);
+    }
+
+    res.json({ success: true, commissions });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// List monthly commissions
+app.get('/api/admin/commissions', requireAdmin, async (req, res) => {
+  try {
+    const { year, month } = req.query;
+    let query = supabase
+      .from('monthly_commissions')
+      .select('*, affiliates(full_name, email, referral_code)')
+      .order('year', { ascending: false })
+      .order('month', { ascending: false });
+
+    if (year) query = query.eq('year', parseInt(year));
+    if (month) query = query.eq('month', parseInt(month));
+
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ success: true, data: data || [] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Approve commission
+app.patch('/api/admin/commissions/:id/approve', requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('monthly_commissions')
+      .update({ status: 'approved', approved_at: new Date().toISOString() })
+      .eq('id', req.params.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    await supabase.from('affiliate_logs').insert({
+      affiliate_id: data.affiliate_id,
+      event_type: 'COMMISSION_APPROVED',
+      details: { commission_id: data.id, amount: data.commission_amount, month: data.month, year: data.year },
+    });
+
+    res.json({ success: true, commission: data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Mark commission as paid
+app.patch('/api/admin/commissions/:id/pay', requireAdmin, async (req, res) => {
+  try {
+    const { paystack_reference } = req.body;
+
+    const { data, error } = await supabase
+      .from('monthly_commissions')
+      .update({
+        status: 'paid',
+        paid_at: new Date().toISOString(),
+        paystack_reference: paystack_reference || null,
+      })
+      .eq('id', req.params.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    await supabase.from('affiliate_logs').insert({
+      affiliate_id: data.affiliate_id,
+      event_type: 'PAYOUT_EXECUTED',
+      details: {
+        commission_id: data.id, amount: data.commission_amount,
+        month: data.month, year: data.year, reference: paystack_reference,
+      },
+    });
+
+    res.json({ success: true, commission: data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Get audit logs
+app.get('/api/admin/affiliate-logs', requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('affiliate_logs')
+      .select('*, affiliates(full_name, email)')
+      .order('created_at', { ascending: false })
+      .limit(200);
+
+    if (error) throw error;
+    res.json({ success: true, data: data || [] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 Omix API server running on port ${PORT}`);
   console.log(`   Paystack: ${PAYSTACK_SECRET?.startsWith('sk_live') ? 'PRODUCTION' : 'TEST'}`);
