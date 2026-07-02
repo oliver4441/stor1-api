@@ -18,5 +18,9 @@ services:
         value: https://stor1-web.onrender.com
       - key: ADMIN_EMAIL
         value: omixsystems@gmail.com
+      - key: SUPABASE_URL
+        value: https://fdwoezyataxhdtgjlfxt.supabase.co
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
       - key: PORT
         value: "3001"
