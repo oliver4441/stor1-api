@@ -57,49 +57,150 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
   }
 }
 
-// ── Startup Migration: ensure payment_method column exists ──
-// Uses a raw fetch against the Supabase Management API on the same project
-(async function runMigration() {
+// ── Startup Migrations ──
+// Runs DDL migrations using the Supabase Management API (service_role key)
+(async function runMigrations() {
   if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) return;
-  try {
-    // Try ALTER TABLE via Supabase SQL REST endpoint (service_role bypasses RLS)
-    const sqlUrl = process.env.SUPABASE_URL.replace(/\/$/, '') + '/rest/v1/rpc/';
-    const response = await fetch(sqlUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'apikey': process.env.SUPABASE_SERVICE_KEY,
-        'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_KEY}`,
-        'Prefer': 'params=single-object',
-      },
-      body: JSON.stringify({
-        sql: `ALTER TABLE omix_orders ADD COLUMN IF NOT EXISTS payment_method text DEFAULT 'pending';`
-      })
-    });
-    if (response.ok) {
-      console.log('[Migration] payment_method column added/confirmed ✅');
-    } else {
-      console.warn('[Migration] Could not add column via REST, trying management API...');
-      // Fallback: try with the project ref from URL
-      const projectRef = process.env.SUPABASE_URL?.match(/https:\/\/([^.]+)/)?.[1];
-      if (projectRef) {
-        const mgmtRes = await fetch(`https://api.supabase.com/v1/projects/${projectRef}/database/query`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_KEY}`,
-          },
-          body: JSON.stringify({
-            query: `ALTER TABLE omix_orders ADD COLUMN IF NOT EXISTS payment_method text DEFAULT 'pending';`
-          })
-        });
-        if (mgmtRes.ok) console.log('[Migration] payment_method column added via mgmt API ✅');
-        else console.warn('[Migration] Management API also failed:', await mgmtRes.text().catch(() => ''));
+
+  const projectRef = process.env.SUPABASE_URL?.match(/https:\/\/([^.]+)/)?.[1];
+  if (!projectRef) return;
+
+  const mgmtApiUrl = `https://api.supabase.com/v1/projects/${projectRef}/database/query`;
+
+  async function runSql(description, query) {
+    try {
+      const res = await fetch(mgmtApiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_KEY}`,
+        },
+        body: JSON.stringify({ query }),
+      });
+      if (res.ok) {
+        console.log(`[Migration] ${description} ✅`);
+        return true;
+      } else {
+        const text = await res.text().catch(() => 'unknown error');
+        console.warn(`[Migration] ${description} failed: ${text}`);
+        return false;
       }
+    } catch (err) {
+      console.warn(`[Migration] ${description} error:`, err.message);
+      return false;
     }
-  } catch (err) {
-    console.warn('[Migration] Startup migration error (non-fatal):', err.message);
   }
+
+  // M1: payment_method column
+  await runSql(
+    'payment_method column',
+    `ALTER TABLE omix_orders ADD COLUMN IF NOT EXISTS payment_method text DEFAULT 'pending';`
+  );
+
+  // M2: Affiliate system foundation
+  await runSql(
+    'affiliates table',
+    `CREATE TABLE IF NOT EXISTS public.affiliates (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
+      full_name TEXT NOT NULL,
+      email TEXT UNIQUE NOT NULL,
+      phone TEXT,
+      mpesa_number TEXT,
+      referral_code TEXT UNIQUE NOT NULL,
+      status TEXT DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );`
+  );
+
+  await runSql(
+    'affiliate_logs table',
+    `CREATE TABLE IF NOT EXISTS public.affiliate_logs (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      affiliate_id UUID REFERENCES public.affiliates(id),
+      event_type TEXT NOT NULL,
+      details JSONB,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );`
+  );
+
+  await runSql(
+    'profiles.referred_by column',
+    `ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS referred_by UUID REFERENCES public.affiliates(id);`
+  );
+
+  await runSql(
+    'affiliate indexes',
+    `CREATE INDEX IF NOT EXISTS idx_profiles_referred_by ON public.profiles(referred_by);
+     CREATE INDEX IF NOT EXISTS idx_affiliates_ref_code ON public.affiliates(referral_code);`
+  );
+
+  await runSql(
+    'updated_at trigger function',
+    `CREATE OR REPLACE FUNCTION public.update_modified_column()
+     RETURNS TRIGGER AS $$
+     BEGIN NEW.updated_at = now(); RETURN NEW; END;
+     $$ LANGUAGE plpgsql;`
+  );
+
+  await runSql(
+    'affiliates updated_at trigger',
+    `DROP TRIGGER IF EXISTS update_affiliates_modtime ON public.affiliates;
+     CREATE TRIGGER update_affiliates_modtime BEFORE UPDATE ON public.affiliates
+     FOR EACH ROW EXECUTE PROCEDURE public.update_modified_column();`
+  );
+
+  // M3: Monthly commissions & order details
+  await runSql(
+    'monthly_commissions table',
+    `CREATE TABLE IF NOT EXISTS public.monthly_commissions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      affiliate_id UUID REFERENCES public.affiliates(id) ON DELETE CASCADE,
+      year INTEGER NOT NULL,
+      month INTEGER NOT NULL CHECK (month BETWEEN 1 AND 12),
+      total_sales DECIMAL(12, 2) DEFAULT 0,
+      qualified_order_count INTEGER DEFAULT 0,
+      commission_rate DECIMAL(4, 4) NOT NULL,
+      commission_amount DECIMAL(12, 2) DEFAULT 0,
+      status TEXT DEFAULT 'calculated' CHECK (status IN ('calculated', 'approved', 'paid', 'cancelled')),
+      approved_at TIMESTAMPTZ,
+      approved_by UUID REFERENCES auth.users(id),
+      paid_at TIMESTAMPTZ,
+      paystack_reference TEXT,
+      notes TEXT,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now(),
+      UNIQUE(affiliate_id, year, month)
+    );`
+  );
+
+  await runSql(
+    'commission_order_details table',
+    `CREATE TABLE IF NOT EXISTS public.commission_order_details (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      commission_id UUID REFERENCES public.monthly_commissions(id) ON DELETE CASCADE,
+      order_id UUID REFERENCES public.omix_orders(id),
+      order_amount DECIMAL(12, 2) DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );`
+  );
+
+  await runSql(
+    'commission indexes',
+    `CREATE INDEX IF NOT EXISTS idx_monthly_commissions_affiliate ON public.monthly_commissions(affiliate_id);
+     CREATE INDEX IF NOT EXISTS idx_monthly_commissions_status ON public.monthly_commissions(status);
+     CREATE INDEX IF NOT EXISTS idx_commission_order_details_commission ON public.commission_order_details(commission_id);`
+  );
+
+  await runSql(
+    'monthly_commissions updated_at trigger',
+    `DROP TRIGGER IF EXISTS update_monthly_commissions_modtime ON public.monthly_commissions;
+     CREATE TRIGGER update_monthly_commissions_modtime BEFORE UPDATE ON public.monthly_commissions
+     FOR EACH ROW EXECUTE PROCEDURE public.update_modified_column();`
+  );
+
+  console.log('[Migration] All startup migrations completed');
 })();
 
 if (!PAYSTACK_SECRET) {
