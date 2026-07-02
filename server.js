@@ -200,6 +200,200 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
      FOR EACH ROW EXECUTE PROCEDURE public.update_modified_column();`
   );
 
+  // M4: Missing affiliate tables
+  await runSql(
+    'affiliate_tiers table',
+    `CREATE TABLE IF NOT EXISTS public.affiliate_tiers (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE,
+      level INTEGER NOT NULL,
+      min_orders INTEGER NOT NULL DEFAULT 0,
+      min_sales DECIMAL(12,2) NOT NULL DEFAULT 0,
+      commission_rate DECIMAL(4,4) NOT NULL,
+      bonus_rate DECIMAL(4,4) NOT NULL DEFAULT 0,
+      description TEXT,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );`
+  );
+
+  await runSql(
+    'affiliate_settings table',
+    `CREATE TABLE IF NOT EXISTS public.affiliate_settings (
+      key TEXT PRIMARY KEY,
+      value JSONB NOT NULL,
+      description TEXT,
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );`
+  );
+
+  await runSql(
+    'referrals table',
+    `CREATE TABLE IF NOT EXISTS public.referrals (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      affiliate_id UUID REFERENCES public.affiliates(id) ON DELETE CASCADE,
+      referred_user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
+      referral_code TEXT NOT NULL,
+      status TEXT DEFAULT 'pending' CHECK (status IN ('pending','converted','expired')),
+      converted_at TIMESTAMPTZ,
+      first_order_id UUID,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      UNIQUE(referred_user_id)
+    );`
+  );
+
+  await runSql(
+    'referral_clicks table',
+    `CREATE TABLE IF NOT EXISTS public.referral_clicks (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      affiliate_id UUID REFERENCES public.affiliates(id) ON DELETE CASCADE,
+      referral_code TEXT NOT NULL,
+      ip_address TEXT,
+      user_agent TEXT,
+      page_url TEXT,
+      converted BOOLEAN DEFAULT false,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );`
+  );
+
+  await runSql(
+    'payout_requests table',
+    `CREATE TABLE IF NOT EXISTS public.payout_requests (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      affiliate_id UUID REFERENCES public.affiliates(id) ON DELETE CASCADE,
+      amount DECIMAL(12,2) NOT NULL,
+      mpesa_number TEXT NOT NULL,
+      mpesa_name TEXT,
+      status TEXT DEFAULT 'pending' CHECK (status IN ('pending','approved','paid','rejected')),
+      payable_after TIMESTAMPTZ,
+      processed_at TIMESTAMPTZ,
+      processed_by UUID REFERENCES auth.users(id),
+      admin_notes TEXT,
+      paystack_reference TEXT,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );`
+  );
+
+  await runSql(
+    'referral & payout indexes',
+    `CREATE INDEX IF NOT EXISTS idx_referrals_affiliate ON public.referrals(affiliate_id);
+     CREATE INDEX IF NOT EXISTS idx_referrals_user ON public.referrals(referred_user_id);
+     CREATE INDEX IF NOT EXISTS idx_referrals_status ON public.referrals(status);
+     CREATE INDEX IF NOT EXISTS idx_referral_clicks_affiliate ON public.referral_clicks(affiliate_id);
+     CREATE INDEX IF NOT EXISTS idx_payout_requests_affiliate ON public.payout_requests(affiliate_id);
+     CREATE INDEX IF NOT EXISTS idx_payout_requests_status ON public.payout_requests(status);`
+  );
+
+  await runSql(
+    'seed affiliate tiers',
+    `INSERT INTO public.affiliate_tiers (name, level, min_orders, min_sales, commission_rate, bonus_rate, description)
+     VALUES
+       ('Bronze', 1, 0, 0, 0.0300, 0, 'Entry tier - 3% commission'),
+       ('Silver', 2, 5, 50000, 0.0500, 0.0050, '5+ orders, 50K KES sales - 5% commission + 0.5% bonus'),
+       ('Gold', 3, 20, 250000, 0.0800, 0.0100, '20+ orders, 250K KES sales - 8% commission + 1% bonus'),
+       ('Platinum', 4, 50, 1000000, 0.1200, 0.0200, '50+ orders, 1M KES sales - 12% commission + 2% bonus')
+     ON CONFLICT (name) DO NOTHING;`
+  );
+
+  await runSql(
+    'seed affiliate settings',
+    `INSERT INTO public.affiliate_settings (key, value, description)
+     VALUES
+       ('min_payout', '"2000"', 'Minimum payout threshold in KES'),
+       ('referral_reward_type', '"points"', 'Reward type: points or cash'),
+       ('referral_reward_value', '"1"', 'Default referral reward value'),
+       ('commission_period', '"monthly"', 'Commission calculation period'),
+       ('attribution_model', '"last_touch"', 'Attribution model for referrals'),
+       ('cookie_expiry_days', '"30"', 'Referral cookie expiration in days'),
+       ('cookie_consent_required', '"true"', 'Whether cookie consent is required'),
+       ('mpesa_b2c_active', '"false"', 'Whether M-Pesa B2C payouts are active'),
+       ('tier_upgrade_frequency', '"monthly"', 'How often tiers are recalculated'),
+       ('max_payout_attempts', '"3"', 'Maximum payout retry attempts'),
+       ('auto_calculate_enabled', '"true"', 'Auto-calculate commissions on schedule'),
+       ('referral_cookie_name', '"omix_ref"', 'Cookie name for referral tracking')
+     ON CONFLICT (key) DO NOTHING;`
+  );
+
+  await runSql(
+    'calculate_affiliate_tier function',
+    `CREATE OR REPLACE FUNCTION public.calculate_affiliate_tier(p_affiliate_id UUID)
+     RETURNS INTEGER AS $func$
+     DECLARE
+       v_total_orders INTEGER;
+       v_total_sales DECIMAL(12,2);
+       v_tier_id INTEGER;
+     BEGIN
+       SELECT COUNT(DISTINCT o.id), COALESCE(SUM(o.total_amount), 0)
+       INTO v_total_orders, v_total_sales
+       FROM public.referrals r
+       JOIN public.omix_orders o ON o.user_id = r.referred_user_id AND o.status IN ('paid','completed','delivered')
+       WHERE r.affiliate_id = p_affiliate_id;
+       SELECT id INTO v_tier_id FROM public.affiliate_tiers
+       WHERE v_total_orders >= min_orders AND v_total_sales >= min_sales
+       ORDER BY level DESC LIMIT 1;
+       RETURN COALESCE(v_tier_id, (SELECT id FROM public.affiliate_tiers WHERE level = 1));
+     END;
+     $func$ LANGUAGE plpgsql;`
+  );
+
+  await runSql(
+    'calculate_monthly_commission function',
+    `CREATE OR REPLACE FUNCTION public.calculate_monthly_commission(
+       p_affiliate_id UUID, p_year INTEGER, p_month INTEGER
+     )
+     RETURNS UUID AS $func$
+     DECLARE
+       v_tier_id INTEGER;
+       v_rate DECIMAL(4,4);
+       v_bonus_rate DECIMAL(4,4);
+       v_user_ids UUID[];
+       v_total_sales DECIMAL(12,2);
+       v_order_count INTEGER;
+       v_commission_amount DECIMAL(12,2);
+       v_commission_id UUID;
+     BEGIN
+       v_tier_id := public.calculate_affiliate_tier(p_affiliate_id);
+       SELECT commission_rate, bonus_rate INTO v_rate, v_bonus_rate
+       FROM public.affiliate_tiers WHERE id = v_tier_id;
+       SELECT array_agg(referred_user_id) INTO v_user_ids
+       FROM public.referrals
+       WHERE affiliate_id = p_affiliate_id AND status = 'converted';
+       IF v_user_ids IS NULL OR array_length(v_user_ids, 1) = 0 THEN
+         RETURN NULL;
+       END IF;
+       SELECT COALESCE(SUM(o.total_amount), 0), COUNT(DISTINCT o.id)
+       INTO v_total_sales, v_order_count
+       FROM public.omix_orders o
+       WHERE o.user_id = ANY(v_user_ids)
+         AND o.status IN ('paid','completed','delivered')
+         AND o.created_at >= make_date(p_year, p_month, 1)
+         AND o.created_at < make_date(p_year, p_month, 1) + interval '1 month';
+       IF v_order_count = 0 THEN RETURN NULL; END IF;
+       v_commission_amount := v_total_sales * (v_rate + v_bonus_rate);
+       INSERT INTO public.monthly_commissions
+         (affiliate_id, year, month, total_sales, qualified_order_count, commission_rate, commission_amount, status)
+       VALUES
+         (p_affiliate_id, p_year, p_month, v_total_sales, v_order_count, v_rate + v_bonus_rate, v_commission_amount, 'calculated')
+       ON CONFLICT (affiliate_id, year, month)
+       DO UPDATE SET
+         total_sales = EXCLUDED.total_sales,
+         qualified_order_count = EXCLUDED.qualified_order_count,
+         commission_rate = EXCLUDED.commission_rate,
+         commission_amount = EXCLUDED.commission_amount,
+         status = 'calculated'
+       RETURNING id INTO v_commission_id;
+       DELETE FROM public.commission_order_details WHERE commission_id = v_commission_id;
+       INSERT INTO public.commission_order_details (commission_id, order_id, order_amount)
+       SELECT v_commission_id, o.id, o.total_amount
+       FROM public.omix_orders o
+       WHERE o.user_id = ANY(v_user_ids)
+         AND o.status IN ('paid','completed','delivered')
+         AND o.created_at >= make_date(p_year, p_month, 1)
+         AND o.created_at < make_date(p_year, p_month, 1) + interval '1 month';
+       RETURN v_commission_id;
+     END;
+     $func$ LANGUAGE plpgsql;`
+  );
+
   console.log('[Migration] All startup migrations completed');
 })();
 
@@ -1476,6 +1670,491 @@ app.get('/api/admin/affiliate-logs', requireAdmin, async (req, res) => {
 
     if (error) throw error;
     res.json({ success: true, data: data || [] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Public Affiliate API Routes ──────────────────────────────────
+
+// Auth middleware — verifies user is logged in (any role)
+async function requireAuth(req, res, next) {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+
+    let token = null;
+    const authHeader = req.headers.authorization;
+    if (authHeader?.startsWith('Bearer ')) {
+      token = authHeader.slice(7);
+    } else if (req.headers.cookie) {
+      for (const c of req.headers.cookie.split(';')) {
+        const eq = c.indexOf('=');
+        const key = eq > 0 ? c.slice(0, eq).trim() : c.trim();
+        const val = eq > 0 ? c.slice(eq + 1).trim() : '';
+        if (key.startsWith('sb-') && key.endsWith('-auth-token')) {
+          try {
+            const session = JSON.parse(decodeURIComponent(val));
+            token = session.access_token || null;
+          } catch { /* ignore */ }
+          break;
+        }
+      }
+    }
+
+    if (!token) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+    req.user = user;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: 'Unauthorized' });
+  }
+}
+
+// 1. GET /api/affiliate/profile/:userId — Get affiliate by user ID
+app.get('/api/affiliate/profile/:userId', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('affiliates')
+      .select('*, affiliate_tiers(name, level, commission_rate, bonus_rate, description)')
+      .eq('user_id', req.params.userId)
+      .single();
+
+    if (error && error.code === 'PGRST116') {
+      return res.json({ success: true, data: null, message: 'Not an affiliate' });
+    }
+    if (error) throw error;
+
+    // Calculate their tier
+    let tierId = null;
+    try {
+      tierId = await supabase.rpc('calculate_affiliate_tier', { p_affiliate_id: data.id });
+    } catch { /* function may not exist yet */ }
+
+    res.json({ success: true, data: { ...data, current_tier_id: tierId?.data || null } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 2. GET /api/affiliate/profile/by-code/:code — Lookup by referral code
+app.get('/api/affiliate/profile/by-code/:code', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('affiliates')
+      .select('id, full_name, referral_code')
+      .eq('referral_code', req.params.code)
+      .eq('status', 'active')
+      .single();
+
+    if (error && error.code === 'PGRST116') {
+      return res.json({ success: true, data: null });
+    }
+    if (error) throw error;
+
+    res.json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 3. POST /api/affiliate/link — Link user to affiliate (last-touch attribution)
+app.post('/api/affiliate/link', requireAuth, async (req, res) => {
+  try {
+    const { referral_code } = req.body;
+    if (!referral_code) return res.status(400).json({ error: 'referral_code required' });
+
+    // Find the affiliate
+    const { data: affiliate } = await supabase
+      .from('affiliates')
+      .select('id')
+      .eq('referral_code', referral_code)
+      .eq('status', 'active')
+      .single();
+
+    if (!affiliate) return res.json({ success: false, message: 'Invalid referral code' });
+
+    // Check existing referral
+    const { data: existing } = await supabase
+      .from('referrals')
+      .select('id')
+      .eq('referred_user_id', req.user.id)
+      .single();
+
+    if (existing) {
+      return res.json({ success: true, message: 'Already linked' });
+    }
+
+    // Create referral (last-touch)
+    const { data: referral, error } = await supabase
+      .from('referrals')
+      .insert({
+        affiliate_id: affiliate.id,
+        referred_user_id: req.user.id,
+        referral_code: referral_code,
+        status: 'pending',
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    // Also update profiles.referred_by for backward compatibility
+    await supabase.from('profiles').update({ referred_by: affiliate.id }).eq('id', req.user.id);
+
+    // Log
+    await supabase.from('affiliate_logs').insert({
+      affiliate_id: affiliate.id,
+      event_type: 'USER_LINKED',
+      details: { referred_user_id: req.user.id, referral_code },
+    });
+
+    res.json({ success: true, data: referral });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 4. GET /api/affiliate/referrals/:affiliateId — Recent referrals
+app.get('/api/affiliate/referrals/:affiliateId', requireAuth, async (req, res) => {
+  try {
+    const { limit = 20 } = req.query;
+    const { data, error } = await supabase
+      .from('referrals')
+      .select('*, profiles(full_name, email), omix_orders!referrals_first_order_id_fkey(id, status, total_amount)')
+      .eq('affiliate_id', req.params.affiliateId)
+      .order('created_at', { ascending: false })
+      .limit(parseInt(limit) || 20);
+
+    if (error) throw error;
+
+    res.json({ success: true, data: data || [] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 5. GET /api/affiliate/commissions/:affiliateId — Monthly commissions
+app.get('/api/affiliate/commissions/:affiliateId', requireAuth, async (req, res) => {
+  try {
+    const { limit = 12 } = req.query;
+    const { data, error } = await supabase
+      .from('monthly_commissions')
+      .select('*, commission_order_details(order_id, order_amount, omix_orders(id, status))')
+      .eq('affiliate_id', req.params.affiliateId)
+      .order('year', { ascending: false })
+      .order('month', { ascending: false })
+      .limit(parseInt(limit) || 12);
+
+    if (error) throw error;
+
+    res.json({ success: true, data: data || [] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 6. GET /api/affiliate/orders/:affiliateId — Qualifying orders (referred users' paid orders)
+app.get('/api/affiliate/orders/:affiliateId', requireAuth, async (req, res) => {
+  try {
+    const { limit = 20, status } = req.query;
+
+    // Get referred user IDs
+    const { data: referrals } = await supabase
+      .from('referrals')
+      .select('referred_user_id')
+      .eq('affiliate_id', req.params.affiliateId);
+
+    if (!referrals || referrals.length === 0) {
+      return res.json({ success: true, data: [] });
+    }
+
+    const userIds = referrals.map(r => r.referred_user_id);
+
+    let query = supabase
+      .from('omix_orders')
+      .select('*, omix_order_items(product_name, quantity, price, product_id)')
+      .in('user_id', userIds)
+      .order('created_at', { ascending: false })
+      .limit(parseInt(limit) || 20);
+
+    if (status) query = query.eq('status', status);
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    res.json({ success: true, data: data || [] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 7. POST /api/affiliate/payout-request — Submit payout request
+app.post('/api/affiliate/payout-request', requireAuth, async (req, res) => {
+  try {
+    const { affiliate_id, amount, mpesa_number, mpesa_name } = req.body;
+    if (!affiliate_id || !amount || !mpesa_number) {
+      return res.status(400).json({ error: 'affiliate_id, amount, and mpesa_number required' });
+    }
+
+    // Check min payout
+    const { data: settings } = await supabase
+      .from('affiliate_settings')
+      .select('value')
+      .eq('key', 'min_payout')
+      .single();
+
+    const minPayout = parseFloat(settings?.value || '2000');
+    const parsedAmount = parseFloat(amount);
+
+    if (parsedAmount < minPayout) {
+      return res.status(400).json({
+        error: `Minimum payout is KES ${minPayout.toLocaleString()}`,
+        min_payout: minPayout,
+      });
+    }
+
+    // Verify the affiliate belongs to this user
+    const { data: affiliate } = await supabase
+      .from('affiliates')
+      .select('id, user_id')
+      .eq('id', affiliate_id)
+      .single();
+
+    if (!affiliate || affiliate.user_id !== req.user.id) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    const { data, error } = await supabase
+      .from('payout_requests')
+      .insert({
+        affiliate_id,
+        amount: parsedAmount,
+        mpesa_number,
+        mpesa_name: mpesa_name || '',
+        status: 'pending',
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    await supabase.from('affiliate_logs').insert({
+      affiliate_id,
+      event_type: 'PAYOUT_REQUESTED',
+      details: { amount: parsedAmount, mpesa_number, request_id: data.id },
+    });
+
+    res.json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 8. GET /api/affiliate/payouts/:affiliateId — Payout history
+app.get('/api/affiliate/payouts/:affiliateId', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('payout_requests')
+      .select('*')
+      .eq('affiliate_id', req.params.affiliateId)
+      .order('created_at', { ascending: false })
+      .limit(50);
+
+    if (error) throw error;
+
+    res.json({ success: true, data: data || [] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 9. GET /api/affiliate/tiers — Get tier definitions
+app.get('/api/affiliate/tiers', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('affiliate_tiers')
+      .select('*')
+      .order('level', { ascending: true });
+
+    if (error) throw error;
+    res.json({ success: true, data: data || [] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 10. GET /api/affiliate/dashboard/:affiliateId — Aggregated dashboard stats
+app.get('/api/affiliate/dashboard/:affiliateId', requireAuth, async (req, res) => {
+  try {
+    const affiliateId = req.params.affiliateId;
+    const now = new Date();
+    const currentYear = now.getFullYear();
+    const currentMonth = now.getMonth() + 1; // 1-indexed
+    const monthStart = new Date(currentYear, currentMonth - 1, 1).toISOString();
+    const monthEnd = new Date(currentYear, currentMonth, 1).toISOString();
+
+    // Get affiliate info with tier
+    const { data: affiliate } = await supabase
+      .from('affiliates')
+      .select('*, affiliate_tiers(name, level, commission_rate, bonus_rate, description)')
+      .eq('id', affiliateId)
+      .single();
+
+    if (!affiliate) return res.status(404).json({ error: 'Affiliate not found' });
+
+    // Referral counts
+    const { data: referrals } = await supabase
+      .from('referrals')
+      .select('status')
+      .eq('affiliate_id', affiliateId);
+
+    const totalReferrals = referrals?.length || 0;
+    const convertedReferrals = referrals?.filter(r => r.status === 'converted').length || 0;
+
+    // Click counts
+    const { data: clicks } = await supabase
+      .from('referral_clicks')
+      .select('id', { count: 'exact', head: true })
+      .eq('affiliate_id', affiliateId);
+
+    const totalClicks = clicks?.length || 0;
+
+    // Current month sales from referred users
+    const referredUserIds = referrals?.filter(r => r.status === 'converted').map(r => r.referred_user_id) || [];
+    let monthlySales = 0;
+    let monthlyOrders = 0;
+
+    if (referredUserIds.length > 0) {
+      const { data: orders } = await supabase
+        .from('omix_orders')
+        .select('total_amount')
+        .in('user_id', referredUserIds)
+        .in('status', ['paid', 'completed', 'delivered'])
+        .gte('created_at', monthStart)
+        .lt('created_at', monthEnd);
+
+      monthlySales = orders?.reduce((s, o) => s + parseFloat(o.total_amount || 0), 0) || 0;
+      monthlyOrders = orders?.length || 0;
+    }
+
+    // Latest commission record
+    const { data: latestCommission } = await supabase
+      .from('monthly_commissions')
+      .select('*')
+      .eq('affiliate_id', affiliateId)
+      .order('year', { ascending: false })
+      .order('month', { ascending: false })
+      .limit(1)
+      .single();
+
+    // Determine current tier
+    let currentTier = { id: 1, name: 'Bronze', level: 1, commission_rate: 0.03, bonus_rate: 0 };
+    try {
+      const tierId = await supabase.rpc('calculate_affiliate_tier', { p_affiliate_id: affiliateId });
+      if (tierId?.data) {
+        const { data: tierData } = await supabase
+          .from('affiliate_tiers')
+          .select('*')
+          .eq('id', tierId.data)
+          .single();
+        if (tierData) currentTier = tierData;
+      }
+    } catch { /* use default */ }
+
+    // Next tier
+    const { data: allTiers } = await supabase
+      .from('affiliate_tiers')
+      .select('*')
+      .order('level', { ascending: true });
+
+    const nextTier = allTiers?.find(t => t.level === currentTier.level + 1) || null;
+
+    // Progress to next tier
+    let progress = null;
+    if (nextTier) {
+      const { data: yearOrders } = await supabase
+        .from('omix_orders')
+        .select('total_amount')
+        .in('user_id', referredUserIds)
+        .in('status', ['paid', 'completed', 'delivered']);
+      const totalYearlySales = yearOrders?.reduce((s, o) => s + parseFloat(o.total_amount || 0), 0) || 0;
+      const totalYearlyOrders = yearOrders?.length || 0;
+
+      progress = {
+        current_orders: totalYearlyOrders,
+        required_orders: nextTier.min_orders,
+        current_sales: totalYearlySales,
+        required_sales: nextTier.min_sales,
+        orders_pct: nextTier.min_orders > 0 ? Math.min(100, Math.round((totalYearlyOrders / nextTier.min_orders) * 100)) : 100,
+        sales_pct: nextTier.min_sales > 0 ? Math.min(100, Math.round((totalYearlySales / nextTier.min_sales) * 100)) : 100,
+      };
+    }
+
+    res.json({
+      success: true,
+      data: {
+        affiliate,
+        currentTier,
+        nextTier,
+        progress,
+        stats: {
+          totalReferrals,
+          convertedReferrals,
+          conversionRate: totalReferrals > 0 ? Math.round((convertedReferrals / totalReferrals) * 100) : 0,
+          totalClicks,
+          monthlySales: Math.round(monthlySales),
+          monthlyOrders,
+        },
+        latestCommission,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 11. POST /api/affiliate/log-click — Log referral click (no auth required)
+app.post('/api/affiliate/log-click', async (req, res) => {
+  try {
+    const { affiliate_id, referral_code, page_url } = req.body;
+    if (!referral_code && !affiliate_id) {
+      return res.status(400).json({ error: 'referral_code or affiliate_id required' });
+    }
+
+    // If only referral_code provided, look up the affiliate
+    let resolvedAffiliateId = affiliate_id;
+    if (!resolvedAffiliateId && referral_code) {
+      const { data: aff } = await supabase
+        .from('affiliates')
+        .select('id')
+        .eq('referral_code', referral_code)
+        .eq('status', 'active')
+        .single();
+      if (aff) resolvedAffiliateId = aff.id;
+    }
+
+    if (!resolvedAffiliateId) {
+      return res.status(404).json({ error: 'Affiliate not found' });
+    }
+
+    const { data, error } = await supabase
+      .from('referral_clicks')
+      .insert({
+        affiliate_id: resolvedAffiliateId,
+        referral_code: referral_code || '',
+        ip_address: req.headers['x-forwarded-for'] || req.ip,
+        user_agent: req.headers['user-agent'] || null,
+        page_url: page_url || null,
+        converted: false,
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json({ success: true, data });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
