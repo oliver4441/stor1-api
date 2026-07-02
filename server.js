@@ -1775,7 +1775,7 @@ app.get('/api/affiliate/profile/:userId', requireAuth, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('affiliates')
-      .select('*, affiliate_tiers(name, level, commission_rate, bonus_rate, description)')
+      .select('*')
       .eq('user_id', req.params.userId)
       .single();
 
@@ -2056,7 +2056,7 @@ app.get('/api/affiliate/dashboard/:affiliateId', requireAuth, async (req, res) =
     // Get affiliate info with tier
     const { data: affiliate } = await supabase
       .from('affiliates')
-      .select('*, affiliate_tiers(name, level, commission_rate, bonus_rate, description)')
+      .select('*')
       .eq('id', affiliateId)
       .single();
 
