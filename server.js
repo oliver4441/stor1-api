@@ -1100,11 +1100,54 @@ app.get('/api/admin/analytics', requireApiKey, async (req, res) => {
 
 // Helper: require admin role
 async function requireAdmin(req, res, next) {
-  if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
   try {
-    // Will check via API key + admin role
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+
+    // Get auth token from Authorization header or Supabase auth cookie
+    let token = null;
+
+    const authHeader = req.headers.authorization;
+    if (authHeader?.startsWith('Bearer ')) {
+      token = authHeader.slice(7);
+    } else if (req.headers.cookie) {
+      // Look for sb-{project-ref}-auth-token cookie
+      for (const c of req.headers.cookie.split(';')) {
+        const eq = c.indexOf('=');
+        const key = eq > 0 ? c.slice(0, eq).trim() : c.trim();
+        const val = eq > 0 ? c.slice(eq + 1).trim() : '';
+        if (key.startsWith('sb-') && key.endsWith('-auth-token')) {
+          try {
+            const session = JSON.parse(decodeURIComponent(val));
+            token = session.access_token || null;
+          } catch { /* ignore malformed cookie */ }
+          break;
+        }
+      }
+    }
+
+    if (!token) return res.status(401).json({ error: 'Unauthorized' });
+
+    // Verify token with Supabase Auth
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+    // Check admin role in profiles
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('role')
+      .eq('id', user.id)
+      .single();
+
+    if (!profile || profile.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    req.user = user;
     next();
-  } catch { res.status(401).json({ error: 'Unauthorized' }); }
+  } catch (err) {
+    console.error('requireAdmin error:', err.message);
+    res.status(401).json({ error: 'Unauthorized' });
+  }
 }
 
 // List all affiliates
