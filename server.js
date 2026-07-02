@@ -394,6 +394,16 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
      $func$ LANGUAGE plpgsql;`
   );
 
+  // M5: Self-signup support — allow 'pending' status for affiliate self-application
+  await runSql(
+    'M5: affiliates status + pending columns',
+    `ALTER TABLE public.affiliates DROP CONSTRAINT IF EXISTS affiliates_status_check;
+     ALTER TABLE public.affiliates ADD CONSTRAINT affiliates_status_check CHECK (status IN ('pending', 'active', 'inactive', 'suspended', 'terminated'));
+     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ;
+     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS approved_by UUID REFERENCES auth.users(id) ON DELETE SET NULL;
+     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS notes TEXT;`
+  );
+
   console.log('[Migration] All startup migrations completed');
 })();
 
@@ -1450,6 +1460,59 @@ app.patch('/api/admin/affiliates/:id', requireAdmin, async (req, res) => {
   }
 });
 
+// Approve or reject affiliate application
+app.patch('/api/admin/affiliates/:id/approve', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { action, notes } = req.body;
+
+    if (!action || !['approve', 'reject'].includes(action)) {
+      return res.status(400).json({ success: false, error: 'Action must be "approve" or "reject"' });
+    }
+
+    const newStatus = action === 'approve' ? 'active' : 'terminated';
+
+    // Update affiliate status
+    const updates = {
+      status: newStatus,
+      notes: notes || null,
+    };
+
+    if (action === 'approve') {
+      updates.approved_at = new Date().toISOString();
+      updates.approved_by = req.user.id;
+    }
+
+    const { data: affiliate, error } = await supabase
+      .from('affiliates')
+      .update(updates)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    // Update user profile role
+    if (action === 'approve') {
+      await supabase.from('profiles').update({ role: 'affiliate' }).eq('id', affiliate.user_id);
+    } else {
+      await supabase.from('profiles').update({ role: 'user' }).eq('id', affiliate.user_id);
+    }
+
+    // Log
+    await supabase.from('affiliate_logs').insert({
+      affiliate_id: id,
+      event_type: action === 'approve' ? 'APPLICATION_APPROVED' : 'APPLICATION_REJECTED',
+      performed_by: req.user.id,
+      details: { action, notes, approved_by: req.user.id },
+    });
+
+    res.json({ success: true, affiliate });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // Calculate monthly commission for all affiliates
 // POST /api/admin/commissions/calculate?year=2026&month=6
 app.post('/api/admin/commissions/calculate', requireAdmin, async (req, res) => {
@@ -2155,6 +2218,76 @@ app.post('/api/affiliate/log-click', async (req, res) => {
 
     if (error) throw error;
     res.json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 12. POST /api/affiliate/apply — Self-signup application
+app.post('/api/affiliate/apply', requireAuth, async (req, res) => {
+  try {
+    const { full_name, phone, mpesa_number } = req.body;
+    if (!full_name || !mpesa_number) {
+      return res.status(400).json({ success: false, error: 'Full name and M-Pesa number are required' });
+    }
+
+    // Check if user already has an affiliate record
+    const { data: existing } = await supabase
+      .from('affiliates')
+      .select('id, status')
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+
+    if (existing) {
+      return res.json({ success: true, data: existing, message: 'Already registered' });
+    }
+
+    // Generate referral code
+    const userId = req.user.id;
+    const code = `AFF-${Math.random().toString(36).substring(2, 6).toUpperCase()}${userId.slice(0, 4).toUpperCase()}`;
+
+    // Create affiliate record with pending status
+    const { data: affiliate, error } = await supabase
+      .from('affiliates')
+      .insert({
+        user_id: userId,
+        full_name,
+        email: req.user.email,
+        phone: phone || null,
+        mpesa_number,
+        referral_code: code,
+        status: 'pending',
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    // Log
+    await supabase.from('affiliate_logs').insert({
+      affiliate_id: affiliate.id,
+      event_type: 'APPLICATION_SUBMITTED',
+      details: { full_name, phone, mpesa_number },
+    });
+
+    res.json({ success: true, data: affiliate });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 13. GET /api/affiliate/application/:userId — Check application status
+app.get('/api/affiliate/application/:userId', requireAuth, async (req, res) => {
+  try {
+    const { data: affiliate, error } = await supabase
+      .from('affiliates')
+      .select('*')
+      .eq('user_id', req.params.userId)
+      .maybeSingle();
+
+    if (error) throw error;
+
+    res.json({ success: true, data: affiliate || null });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
