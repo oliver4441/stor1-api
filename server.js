@@ -58,33 +58,27 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
 }
 
 // ── Startup Migrations ──
-// Runs DDL migrations using the Supabase Management API (service_role key)
+// Runs DDL migrations at startup using supabase.rpc('exec_sql', ...)
+// Requires the public.exec_sql() function to exist in the database.
 (async function runMigrations() {
   if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) return;
 
-  const projectRef = process.env.SUPABASE_URL?.match(/https:\/\/([^.]+)/)?.[1];
-  if (!projectRef) return;
-
-  const mgmtApiUrl = `https://api.supabase.com/v1/projects/${projectRef}/database/query`;
+  // Wait briefly for the Supabase client to initialize
+  await new Promise(r => setTimeout(r, 100));
 
   async function runSql(description, query) {
+    if (!supabase) {
+      console.warn(`[Migration] ${description} skipped: supabase client not initialized`);
+      return false;
+    }
     try {
-      const res = await fetch(mgmtApiUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_KEY}`,
-        },
-        body: JSON.stringify({ query }),
-      });
-      if (res.ok) {
-        console.log(`[Migration] ${description} ✅`);
-        return true;
-      } else {
-        const text = await res.text().catch(() => 'unknown error');
-        console.warn(`[Migration] ${description} failed: ${text}`);
+      const { error } = await supabase.rpc('exec_sql', { sql: query });
+      if (error) {
+        console.warn(`[Migration] ${description} failed: ${error.message}`);
         return false;
       }
+      console.log(`[Migration] ${description} OK`);
+      return true;
     } catch (err) {
       console.warn(`[Migration] ${description} error:`, err.message);
       return false;
