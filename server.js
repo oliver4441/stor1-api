@@ -279,29 +279,27 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
   );
 
   await runSql(
-    'seed affiliate tiers',
-    `INSERT INTO public.affiliate_tiers (name, level, min_orders, min_sales, commission_rate, bonus_rate, description)
+    'seed affiliate tiers (spec alignment)',
+    `DELETE FROM public.affiliate_tiers;
+     INSERT INTO public.affiliate_tiers (name, level, min_orders, min_sales, commission_rate, bonus_rate, description)
      VALUES
-       ('Bronze', 1, 0, 0, 0.0300, 0, 'Entry tier - 3% commission'),
-       ('Silver', 2, 5, 50000, 0.0500, 0.0050, '5+ orders, 50K KES sales - 5% commission + 0.5% bonus'),
-       ('Gold', 3, 20, 250000, 0.0800, 0.0100, '20+ orders, 250K KES sales - 8% commission + 1% bonus'),
-       ('Platinum', 4, 50, 1000000, 0.1200, 0.0200, '50+ orders, 1M KES sales - 12% commission + 2% bonus')
+       ('Silver', 1, 0, 0, 0.0500, 0, '0-29 qualified sales - 5% commission'),
+       ('Gold', 2, 30, 0, 0.1000, 0, '30+ qualified sales - 10% commission (maximum)')
      ON CONFLICT (name) DO NOTHING;`
   );
 
   await runSql(
-    'seed affiliate settings',
-    `INSERT INTO public.affiliate_settings (key, value, description)
+    'seed affiliate settings (spec alignment)',
+    `DELETE FROM public.affiliate_settings WHERE key IN ('attribution_model', 'cookie_expiry_days', 'referral_reward_type', 'referral_reward_value');
+     INSERT INTO public.affiliate_settings (key, value, description)
      VALUES
        ('min_payout', '"2000"', 'Minimum payout threshold in KES'),
-       ('referral_reward_type', '"points"', 'Reward type: points or cash'),
-       ('referral_reward_value', '"1"', 'Default referral reward value'),
        ('commission_period', '"monthly"', 'Commission calculation period'),
-       ('attribution_model', '"last_touch"', 'Attribution model for referrals'),
-       ('cookie_expiry_days', '"30"', 'Referral cookie expiration in days'),
-       ('cookie_consent_required', '"true"', 'Whether cookie consent is required'),
-       ('mpesa_b2c_active', '"false"', 'Whether M-Pesa B2C payouts are active'),
-       ('tier_upgrade_frequency', '"monthly"', 'How often tiers are recalculated'),
+       ('attribution_model', '"first_touch"', 'First attribution always wins — never overwritten'),
+       ('cookie_expiry_days', '"36525"', 'Permanent cookie (100 years) — spec says never expires'),
+       ('cookie_consent_required', '"false"', 'Cookie consent not required for affiliate tracking'),
+       ('mpesa_b2c_active', '"true"', 'M-Pesa B2C payouts active'),
+       ('tier_upgrade_frequency', '"yearly"', 'Tiers recalculated yearly per spec'),
        ('max_payout_attempts', '"3"', 'Maximum payout retry attempts'),
        ('auto_calculate_enabled', '"true"', 'Auto-calculate commissions on schedule'),
        ('referral_cookie_name', '"omix_ref"', 'Cookie name for referral tracking')
@@ -418,10 +416,47 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
   await runSql(
     'M5: affiliates status + pending columns',
     `ALTER TABLE public.affiliates DROP CONSTRAINT IF EXISTS affiliates_status_check;
-     ALTER TABLE public.affiliates ADD CONSTRAINT affiliates_status_check CHECK (status IN ('pending', 'active', 'inactive', 'suspended', 'terminated'));
+     ALTER TABLE public.affiliates ADD CONSTRAINT affiliates_status_check CHECK (status IN ('active', 'inactive'));
      ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ;
      ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS approved_by UUID REFERENCES auth.users(id) ON DELETE SET NULL;
      ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS notes TEXT;`
+  );
+
+  // M6: Spec alignment — commission lifecycle, yearly tiers, payout columns
+  await runSql(
+    'M6: monthly_commissions status lifecycle',
+    `ALTER TABLE public.monthly_commissions DROP CONSTRAINT IF EXISTS monthly_commissions_status_check;
+     ALTER TABLE public.monthly_commissions ADD CONSTRAINT monthly_commissions_status_check
+       CHECK (status IN ('pending', 'calculated', 'approved', 'paid', 'cancelled'));`
+  );
+
+  await runSql(
+    'M6: yearly tier calculation function',
+    `CREATE OR REPLACE FUNCTION public.calculate_affiliate_tier(p_affiliate_id UUID)
+     RETURNS INTEGER AS $func$
+     DECLARE
+       v_total_orders INTEGER;
+       v_current_year INTEGER := EXTRACT(YEAR FROM NOW());
+       v_tier_id INTEGER;
+     BEGIN
+       SELECT COUNT(DISTINCT o.id)
+       INTO v_total_orders
+       FROM public.referrals r
+       JOIN public.omix_orders o ON o.user_id = r.referred_user_id AND o.status IN ('paid','completed','delivered')
+       WHERE r.affiliate_id = p_affiliate_id
+         AND EXTRACT(YEAR FROM o.created_at) = v_current_year;
+       SELECT id INTO v_tier_id FROM public.affiliate_tiers
+       WHERE v_total_orders >= min_orders
+       ORDER BY level DESC LIMIT 1;
+       RETURN COALESCE(v_tier_id, (SELECT id FROM public.affiliate_tiers WHERE level = 1));
+     END;
+     $func$ LANGUAGE plpgsql;`
+  );
+
+  await runSql(
+    'M6: payout_requests approved_at/approved_by columns',
+    `ALTER TABLE public.payout_requests ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ;
+     ALTER TABLE public.payout_requests ADD COLUMN IF NOT EXISTS approved_by UUID REFERENCES auth.users(id) ON DELETE SET NULL;`
   );
 
   console.log('[Migration] All startup migrations completed');
@@ -1524,8 +1559,8 @@ app.patch('/api/admin/affiliates/:id/approve', requireAdmin, async (req, res) =>
     // Log
     await supabase.from('affiliate_logs').insert({
       affiliate_id: id,
-      event_type: action === 'approve' ? 'APPLICATION_APPROVED' : 'APPLICATION_REJECTED',
-      details: { action, notes, approved_by: req.user.id },
+      event_type: action === 'approve' ? 'AFFILIATE_ACTIVATED' : 'AFFILIATE_DEACTIVATED',
+      details: { action, notes, processed_by: req.user.id },
     });
 
     res.json({ success: true, affiliate });
@@ -1868,7 +1903,7 @@ app.get('/api/affiliate/profile/by-code/:code', async (req, res) => {
   }
 });
 
-// 3. POST /api/affiliate/link — Link user to affiliate (last-touch attribution)
+// 3. POST /api/affiliate/link — Link user to affiliate (first-attribution wins)
 app.post('/api/affiliate/link', requireAuth, async (req, res) => {
   try {
     const { referral_code } = req.body;
@@ -1877,14 +1912,19 @@ app.post('/api/affiliate/link', requireAuth, async (req, res) => {
     // Find the affiliate
     const { data: affiliate } = await supabase
       .from('affiliates')
-      .select('id')
+      .select('id, user_id')
       .eq('referral_code', referral_code)
       .eq('status', 'active')
       .single();
 
     if (!affiliate) return res.json({ success: false, message: 'Invalid referral code' });
 
-    // Check existing referral
+    // Block self-referral
+    if (affiliate.user_id === req.user.id) {
+      return res.status(400).json({ success: false, error: 'Self-referral is not permitted' });
+    }
+
+    // Check existing referral (first-attribution: never overwrite)
     const { data: existing } = await supabase
       .from('referrals')
       .select('id')
@@ -1895,7 +1935,7 @@ app.post('/api/affiliate/link', requireAuth, async (req, res) => {
       return res.json({ success: true, message: 'Already linked' });
     }
 
-    // Create referral (last-touch)
+    // Create referral
     const { data: referral, error } = await supabase
       .from('referrals')
       .insert({
@@ -2176,7 +2216,7 @@ app.get('/api/affiliate/dashboard/:affiliateId', requireAuth, async (req, res) =
       .reduce((s, c) => s + parseFloat(c.commission_amount || 0), 0);
 
     // Determine current tier
-    let currentTier = { id: 1, name: 'Bronze', level: 1, commission_rate: 0.03, bonus_rate: 0 };
+    let currentTier = { id: 1, name: 'Silver', level: 1, commission_rate: 0.05, bonus_rate: 0 };
     try {
       const tierId = await supabase.rpc('calculate_affiliate_tier', { p_affiliate_id: affiliateId });
       if (tierId?.data) {
@@ -2282,76 +2322,6 @@ app.post('/api/affiliate/log-click', async (req, res) => {
 
     if (error) throw error;
     res.json({ success: true, data });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// 12. POST /api/affiliate/apply — Self-signup application
-app.post('/api/affiliate/apply', requireAuth, async (req, res) => {
-  try {
-    const { full_name, phone, mpesa_number } = req.body;
-    if (!full_name || !mpesa_number) {
-      return res.status(400).json({ success: false, error: 'Full name and M-Pesa number are required' });
-    }
-
-    // Check if user already has an affiliate record
-    const { data: existing } = await supabase
-      .from('affiliates')
-      .select('id, status')
-      .eq('user_id', req.user.id)
-      .maybeSingle();
-
-    if (existing) {
-      return res.json({ success: true, data: existing, message: 'Already registered' });
-    }
-
-    // Generate referral code
-    const userId = req.user.id;
-    const code = `AFF-${Math.random().toString(36).substring(2, 6).toUpperCase()}${userId.slice(0, 4).toUpperCase()}`;
-
-    // Create affiliate record with pending status
-    const { data: affiliate, error } = await supabase
-      .from('affiliates')
-      .insert({
-        user_id: userId,
-        full_name,
-        email: req.user.email,
-        phone: phone || null,
-        mpesa_number,
-        referral_code: code,
-        status: 'pending',
-      })
-      .select()
-      .single();
-
-    if (error) throw error;
-
-    // Log
-    await supabase.from('affiliate_logs').insert({
-      affiliate_id: affiliate.id,
-      event_type: 'APPLICATION_SUBMITTED',
-      details: { full_name, phone, mpesa_number },
-    });
-
-    res.json({ success: true, data: affiliate });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// 13. GET /api/affiliate/application/:userId — Check application status
-app.get('/api/affiliate/application/:userId', requireAuth, async (req, res) => {
-  try {
-    const { data: affiliate, error } = await supabase
-      .from('affiliates')
-      .select('*')
-      .eq('user_id', req.params.userId)
-      .maybeSingle();
-
-    if (error) throw error;
-
-    res.json({ success: true, data: affiliate || null });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
