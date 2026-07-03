@@ -1687,7 +1687,7 @@ app.patch('/api/admin/commissions/:id/approve', requireAdmin, async (req, res) =
   try {
     const { data, error } = await supabase
       .from('monthly_commissions')
-      .update({ status: 'approved', approved_at: new Date().toISOString() })
+      .update({ status: 'approved', approved_at: new Date().toISOString(), approved_by: req.user.id })
       .eq('id', req.params.id)
       .select()
       .single();
