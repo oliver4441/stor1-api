@@ -1525,7 +1525,6 @@ app.patch('/api/admin/affiliates/:id/approve', requireAdmin, async (req, res) =>
     await supabase.from('affiliate_logs').insert({
       affiliate_id: id,
       event_type: action === 'approve' ? 'APPLICATION_APPROVED' : 'APPLICATION_REJECTED',
-      performed_by: req.user.id,
       details: { action, notes, approved_by: req.user.id },
     });
 
@@ -1716,6 +1715,69 @@ app.get('/api/admin/affiliate-logs', requireAdmin, async (req, res) => {
 
     if (error) throw error;
     res.json({ success: true, data: data || [] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Admin Payout Request Management ────────────────────────────
+
+// List payout requests (admin)
+app.get('/api/admin/payout-requests', requireAdmin, async (req, res) => {
+  try {
+    const { status } = req.query;
+    let query = supabase
+      .from('payout_requests')
+      .select('*, affiliates(full_name, email, mpesa_number)')
+      .order('created_at', { ascending: false })
+      .limit(200);
+
+    if (status) {
+      query = query.eq('status', status);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ success: true, data: data || [] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Approve or reject a payout request (admin)
+app.patch('/api/admin/payout-requests/:id/approve', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { action, admin_notes } = req.body;
+
+    if (!action || !['approve', 'reject'].includes(action)) {
+      return res.status(400).json({ success: false, error: 'Action must be "approve" or "reject"' });
+    }
+
+    const newStatus = action === 'approve' ? 'approved' : 'rejected';
+
+    const { data: payout, error } = await supabase
+      .from('payout_requests')
+      .update({
+        status: newStatus,
+        admin_notes: admin_notes || null,
+        processed_at: new Date().toISOString(),
+        processed_by: req.user.id,
+      })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    // Log the action
+    await supabase.from('affiliate_logs').insert({
+      affiliate_id: payout.affiliate_id,
+      event_type: action === 'approve' ? 'PAYOUT_APPROVED' : 'PAYOUT_REJECTED',
+      details: { payout_id: id, amount: payout.amount, admin_notes, processed_by: req.user.id },
+    });
+
+    res.json({ success: true, data: payout });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -2043,12 +2105,13 @@ app.get('/api/affiliate/dashboard/:affiliateId', requireAuth, async (req, res) =
     const monthEnd = new Date(currentYear, currentMonth, 1).toISOString();
 
     // Get affiliate info with tier
-    const { data: affiliate } = await supabase
+    const { data: affiliate, error: affError } = await supabase
       .from('affiliates')
       .select('*')
       .eq('id', affiliateId)
-      .single();
+      .maybeSingle();
 
+    if (affError) throw affError;
     if (!affiliate) return res.status(404).json({ error: 'Affiliate not found' });
 
     // Referral counts
@@ -2086,15 +2149,31 @@ app.get('/api/affiliate/dashboard/:affiliateId', requireAuth, async (req, res) =
       monthlyOrders = orders?.length || 0;
     }
 
-    // Latest commission record
-    const { data: latestCommission } = await supabase
+    // Latest commission record (may not exist yet for new affiliates)
+    const { data: latestCommission, error: lcError } = await supabase
       .from('monthly_commissions')
       .select('*')
       .eq('affiliate_id', affiliateId)
       .order('year', { ascending: false })
       .order('month', { ascending: false })
       .limit(1)
-      .single();
+      .maybeSingle();
+
+    if (lcError) throw lcError;
+
+    // Commission totals by status
+    const { data: allCommissions } = await supabase
+      .from('monthly_commissions')
+      .select('status, commission_amount')
+      .eq('affiliate_id', affiliateId);
+
+    const totalPendingCommission = (allCommissions || [])
+      .filter(c => c.status === 'pending' || c.status === 'approved')
+      .reduce((s, c) => s + parseFloat(c.commission_amount || 0), 0);
+
+    const totalPaidCommission = (allCommissions || [])
+      .filter(c => c.status === 'paid')
+      .reduce((s, c) => s + parseFloat(c.commission_amount || 0), 0);
 
     // Determine current tier
     let currentTier = { id: 1, name: 'Bronze', level: 1, commission_rate: 0.03, bonus_rate: 0 };
@@ -2155,6 +2234,8 @@ app.get('/api/affiliate/dashboard/:affiliateId', requireAuth, async (req, res) =
           monthlyOrders,
         },
         latestCommission,
+        totalPendingCommission,
+        totalPaidCommission,
       },
     });
   } catch (err) {
