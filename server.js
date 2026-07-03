@@ -2277,3 +2277,4 @@ app.listen(PORT, () => {
   console.log(`   Paystack: ${PAYSTACK_SECRET?.startsWith('sk_live') ? 'PRODUCTION' : 'TEST'}`);
   console.log(`   Subaccount: ${OMIX_SUBACCOUNT_CODE || 'Not configured'}`);
 });
+// CRON_SECRET pick up marker
