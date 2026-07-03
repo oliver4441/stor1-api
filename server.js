@@ -428,14 +428,13 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
 })();
 
 if (!PAYSTACK_SECRET) {
-  console.error('PAYSTACK_SECRET_KEY not set!');
-  process.exit(1);
+  console.warn('PAYSTACK_SECRET_KEY not set — Paystack routes will return 503');
 }
 
-const paystackHeaders = {
+const paystackHeaders = PAYSTACK_SECRET ? {
   Authorization: `Bearer ${PAYSTACK_SECRET}`,
   'Content-Type': 'application/json',
-};
+} : null;
 
 // ── Health check ──
 app.get('/health', (req, res) => {
@@ -653,6 +652,7 @@ app.post('/api/nia/chat', async (req, res) => {
 
 // ── Initialize Paystack Inline Payment ─────────────────────────────────────────
 app.post('/api/paystack/initialize', async (req, res) => {
+  if (!PAYSTACK_SECRET) return res.status(503).json({ message: 'Payment service not configured' });
   try {
     // Check maintenance mode first (if Supabase is available)
     if (supabase) {
@@ -720,6 +720,7 @@ app.post('/api/paystack/initialize', async (req, res) => {
 
 // ── Verify transaction ──
 app.get('/api/paystack/verify/:reference', async (req, res) => {
+  if (!PAYSTACK_SECRET) return res.status(503).json({ message: 'Payment service not configured' });
   try {
     const { reference } = req.params;
 
@@ -1018,6 +1019,7 @@ app.post('/api/email/abandoned-cart', requireApiKey, async (req, res) => {
 
 // ── Create subaccount (for organizers to receive payouts) ──
 app.post('/api/paystack/subaccount', requireApiKey, async (req, res) => {
+  if (!PAYSTACK_SECRET) return res.status(503).json({ message: 'Payment service not configured' });
   try {
     const { business_name, bank_code, account_number } = req.body;
 
