@@ -1791,14 +1791,23 @@ app.patch('/api/admin/payout-requests/:id/approve', requireAdmin, async (req, re
 
     const newStatus = action === 'approve' ? 'approved' : 'rejected';
 
+    const updateFields = {
+      status: newStatus,
+      admin_notes: admin_notes || null,
+    };
+
+    // Approval sets approved_at/approved_by; rejection sets processed_at/processed_by
+    if (action === 'approve') {
+      updateFields.approved_at = new Date().toISOString();
+      updateFields.approved_by = req.user.id;
+    } else {
+      updateFields.processed_at = new Date().toISOString();
+      updateFields.processed_by = req.user.id;
+    }
+
     const { data: payout, error } = await supabase
       .from('payout_requests')
-      .update({
-        status: newStatus,
-        admin_notes: admin_notes || null,
-        processed_at: new Date().toISOString(),
-        processed_by: req.user.id,
-      })
+      .update(updateFields)
       .eq('id', id)
       .select()
       .single();
