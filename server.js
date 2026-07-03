@@ -1818,7 +1818,7 @@ app.patch('/api/admin/payout-requests/:id/approve', requireAdmin, async (req, re
     await supabase.from('affiliate_logs').insert({
       affiliate_id: payout.affiliate_id,
       event_type: action === 'approve' ? 'PAYOUT_APPROVED' : 'PAYOUT_REJECTED',
-      details: { payout_id: id, amount: payout.amount, admin_notes, processed_by: req.user.id },
+      details: { payout_id: id, amount: payout.amount, admin_notes, [action === 'approve' ? 'approved_by' : 'processed_by']: req.user.id },
     });
 
     res.json({ success: true, data: payout });
