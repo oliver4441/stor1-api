@@ -1978,16 +1978,47 @@ app.post('/api/affiliate/link', requireAuth, async (req, res) => {
 app.get('/api/affiliate/referrals/:affiliateId', requireAuth, async (req, res) => {
   try {
     const { limit = 20 } = req.query;
-    const { data, error } = await supabase
+    // Fetch referrals first (no FK join — Supabase schema cache missing relations)
+    const { data: referrals, error } = await supabase
       .from('referrals')
-      .select('*, profiles(full_name, email), omix_orders!referrals_first_order_id_fkey(id, status, total_amount)')
+      .select('*')
       .eq('affiliate_id', req.params.affiliateId)
       .order('created_at', { ascending: false })
       .limit(parseInt(limit) || 20);
 
     if (error) throw error;
 
-    res.json({ success: true, data: data || [] });
+    // Enrich with referred user profile info
+    const enriched = await Promise.all((referrals || []).map(async (ref) => {
+      let referredUser = null;
+      if (ref.referred_user_id) {
+        const { data: prof } = await supabase
+          .from('profiles')
+          .select('full_name, email')
+          .eq('id', ref.referred_user_id)
+          .single();
+        referredUser = prof;
+      }
+
+      let orderInfo = null;
+      if (ref.first_order_id) {
+        const { data: ord } = await supabase
+          .from('omix_orders')
+          .select('id, status, total_amount')
+          .eq('id', ref.first_order_id)
+          .single();
+        orderInfo = ord;
+      }
+
+      return {
+        ...ref,
+        full_name: referredUser?.full_name || 'Customer',
+        email: referredUser?.email || null,
+        first_order: orderInfo,
+      };
+    }));
+
+    res.json({ success: true, data: enriched });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
