@@ -1381,7 +1381,7 @@ app.get('/api/admin/affiliates', requireAdmin, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('affiliates')
-      .select('*, profiles(full_name, email, role)')
+      .select('*')
       .order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ success: true, data: data || [] });
