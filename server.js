@@ -388,6 +388,31 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
      $func$ LANGUAGE plpgsql;`
   );
 
+  // Auto-convert referral on qualifying order
+  await runSql(
+    'referral conversion trigger',
+    `CREATE OR REPLACE FUNCTION public.convert_referral_on_order()
+     RETURNS TRIGGER AS $func$
+     BEGIN
+       IF NEW.status IN ('paid','completed','delivered') THEN
+         UPDATE public.referrals
+         SET status = 'converted',
+             converted_at = COALESCE(NEW.paid_at, NOW()),
+             first_order_id = CASE WHEN first_order_id IS NULL THEN NEW.id ELSE first_order_id END
+         WHERE referred_user_id = NEW.user_id
+           AND status = 'pending'
+           AND first_order_id IS NULL;
+       END IF;
+       RETURN NEW;
+     END;
+     $func$ LANGUAGE plpgsql SECURITY DEFINER;
+     DROP TRIGGER IF EXISTS trg_convert_referral_on_order ON public.omix_orders;
+     CREATE TRIGGER trg_convert_referral_on_order
+       AFTER INSERT OR UPDATE OF status ON public.omix_orders
+       FOR EACH ROW
+       EXECUTE FUNCTION public.convert_referral_on_order();`
+  );
+
   // M5: Self-signup support — allow 'pending' status for affiliate self-application
   await runSql(
     'M5: affiliates status + pending columns',
@@ -1507,136 +1532,96 @@ app.patch('/api/admin/affiliates/:id/approve', requireAdmin, async (req, res) =>
   }
 });
 
-// Calculate monthly commission for all affiliates
-// POST /api/admin/commissions/calculate?year=2026&month=6
-app.post('/api/admin/commissions/calculate', requireAdmin, async (req, res) => {
+// Calculate monthly commission for all affiliates via PG function
+// POST /api/admin/commissions/calculate?year=2026&month=7
+// Supports ?key=CRON_SECRET for scheduled cron jobs (no JWT expiry issue)
+app.post('/api/admin/commissions/calculate', async (req, res) => {
   try {
-    const year = parseInt(req.query.year) || new Date().getFullYear();
-    const month = parseInt(req.query.month) || new Date().getMonth(); // 0-indexed
+    // Allow cron key auth for scheduled jobs
+    const cronKey = req.query.key;
+    if (cronKey && cronKey === process.env.CRON_SECRET) {
+      await handleCommissionCalc(req, res);
+    } else {
+      requireAdmin(req, res, async () => {
+        await handleCommissionCalc(req, res);
+      });
+    }
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 
-    const monthStart = new Date(year, month, 1).toISOString();
-    const monthEnd = new Date(year, month + 1, 1).toISOString();
+async function handleCommissionCalc(req, res) {
+  try {
+    const now = new Date();
+    const year = parseInt(req.query.year) || now.getFullYear();
+    const month = parseInt(req.query.month) || (now.getMonth() + 1); // 1-indexed
 
     // Get all active affiliates
-    const { data: affiliates } = await supabase
+    const { data: affiliates, error: affError } = await supabase
       .from('affiliates')
-      .select('*')
+      .select('id, full_name')
       .eq('status', 'active');
+
+    if (affError) throw affError;
 
     if (!affiliates || affiliates.length === 0) {
       return res.json({ success: true, message: 'No active affiliates', commissions: [] });
     }
 
-    const commissions = [];
+    const results = [];
 
     for (const affiliate of affiliates) {
-      // Get referred user IDs
-      const { data: referredUsers } = await supabase
-        .from('profiles')
-        .select('id')
-        .eq('referred_by', affiliate.id);
+      try {
+        const { data: commissionId, error: rpcError } = await supabase
+          .rpc('calculate_monthly_commission', {
+            p_affiliate_id: affiliate.id,
+            p_year: year,
+            p_month: month,
+          });
 
-      const userIds = (referredUsers || []).map(u => u.id);
-      if (userIds.length === 0) continue;
+        if (rpcError) throw rpcError;
 
-      // Get qualified orders in this month
-      const { data: orders } = await supabase
-        .from('omix_orders')
-        .select('id, total_amount, status')
-        .in('user_id', userIds)
-        .gte('created_at', monthStart)
-        .lt('created_at', monthEnd)
-        .in('status', ['paid', 'completed', 'delivered']);
+        if (commissionId) {
+          const { data: record } = await supabase
+            .from('monthly_commissions')
+            .select('*')
+            .eq('id', commissionId)
+            .single();
 
-      if (!orders || orders.length === 0) continue;
-
-      const totalSales = orders.reduce((sum, o) => sum + parseFloat(o.total_amount || 0), 0);
-      const orderCount = orders.length;
-
-      // Determine tier and rate
-      // Count total qualified sales in current year
-      const yearStart = new Date(year, 0, 1).toISOString();
-      const { data: yearOrders } = await supabase
-        .from('omix_orders')
-        .select('id')
-        .in('user_id', userIds)
-        .gte('created_at', yearStart)
-        .lt('created_at', monthEnd)
-        .in('status', ['paid', 'completed', 'delivered']);
-
-      const yearlyCount = (yearOrders || []).length;
-      const tier = yearlyCount >= 30 ? 'gold' : 'silver';
-      const rate = tier === 'gold' ? 0.10 : 0.05;
-      const commissionAmount = Math.round(totalSales * rate);
-
-      // Upsert commission record
-      const { data: existing } = await supabase
-        .from('monthly_commissions')
-        .select('id')
-        .eq('affiliate_id', affiliate.id)
-        .eq('year', year)
-        .eq('month', month + 1)
-        .single();
-
-      let commission;
-      if (existing) {
-        const { data: updated } = await supabase
-          .from('monthly_commissions')
-          .update({
-            total_sales: totalSales,
-            qualified_order_count: orderCount,
-            commission_rate: rate,
-            commission_amount: commissionAmount,
-          })
-          .eq('id', existing.id)
-          .select()
-          .single();
-        commission = updated;
-      } else {
-        const { data: inserted } = await supabase
-          .from('monthly_commissions')
-          .insert({
+          await supabase.from('affiliate_logs').insert({
             affiliate_id: affiliate.id,
-            year,
-            month: month + 1,
-            total_sales: totalSales,
-            qualified_order_count: orderCount,
-            commission_rate: rate,
-            commission_amount: commissionAmount,
-          })
-          .select()
-          .single();
-        commission = inserted;
+            event_type: 'COMMISSION_CALCULATED',
+            details: { year, month, commission_id: commissionId, total_sales: record?.total_sales, commission_amount: record?.commission_amount },
+          });
+
+          results.push(commissionId);
+        } else {
+          results.push(null);
+        }
+      } catch (err) {
+        console.error(`Commission calc failed for affiliate ${affiliate.id}:`, err.message);
+        results.push(null);
       }
-
-      // Store individual order details for audit
-      const orderDetails = orders.map(o => ({
-        commission_id: commission.id,
-        order_id: o.id,
-        order_amount: o.total_amount,
-      }));
-
-      if (orderDetails.length > 0) {
-        // Clear previous order links, then insert fresh
-        await supabase.from('commission_order_details').delete().eq('commission_id', commission.id);
-        await supabase.from('commission_order_details').insert(orderDetails);
-      }
-
-      // Log the calculation
-      await supabase.from('affiliate_logs').insert({
-        affiliate_id: affiliate.id,
-        event_type: 'COMMISSION_CALCULATED',
-        details: { year, month: month + 1, totalSales, orderCount, rate, commissionAmount },
-      });
-
-      commissions.push(commission);
     }
 
-    res.json({ success: true, commissions });
+    // Fetch all updated commissions for the response
+    const { data: commissions } = await supabase
+      .from('monthly_commissions')
+      .select('*, affiliates(full_name, email, referral_code)')
+      .eq('year', year)
+      .eq('month', month)
+      .order('commission_amount', { ascending: false });
+
+    res.json({
+      success: true,
+      message: `Calculated commissions for ${affiliates.length} affiliates`,
+      commissions: commissions || [],
+    });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
-});
+}
 
 // List monthly commissions
 app.get('/api/admin/commissions', requireAdmin, async (req, res) => {
