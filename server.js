@@ -28,7 +28,7 @@ const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
 const PAYSTACK_PUBLIC = process.env.PAYSTACK_PUBLIC_KEY;
 const OMIX_SUBACCOUNT_CODE = process.env.OMIX_SUBACCOUNT_CODE;
 const PORT = process.env.PORT || 3001;
-const CRON_SECRET_FALLBACK = '75St3Y...iy8Q';
+const CRON_SECRET_FALLBACK = '75St3YYb2d519_m0_ifZoFxF7sp-8YUYgZAPYYWiy8Q';
 
 // VAPID keys for web push
 const VAPID_PUBLIC_KEY = process.env.VITE_VAPID_PUBLIC_KEY || process.env.VAPID_PUBLIC_KEY || '';
