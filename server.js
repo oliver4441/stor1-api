@@ -1746,7 +1746,23 @@ app.get('/api/admin/affiliate-logs', requireAdmin, async (req, res) => {
       .from('affiliate_logs')
       .select('*, affiliates(full_name, email)')
       .order('created_at', { ascending: false })
-      .limit(200);
+      .limit(parseInt(req.query.limit) || 200);
+
+    if (error) throw error;
+    res.json({ success: true, data: data || [] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Alias: /api/admin/audit-logs → affiliate_logs table
+app.get('/api/admin/audit-logs', requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('affiliate_logs')
+      .select('*, affiliates(full_name, email)')
+      .order('created_at', { ascending: false })
+      .limit(parseInt(req.query.limit) || 50);
 
     if (error) throw error;
     res.json({ success: true, data: data || [] });
@@ -1765,7 +1781,29 @@ app.get('/api/admin/payout-requests', requireAdmin, async (req, res) => {
       .from('payout_requests')
       .select('*, affiliates(full_name, email, mpesa_number)')
       .order('created_at', { ascending: false })
-      .limit(200);
+      .limit(parseInt(req.query.limit) || 200);
+
+    if (status) {
+      query = query.eq('status', status);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ success: true, data: data || [] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Alias: /api/admin/payouts → payout_requests table (frontend compat)
+app.get('/api/admin/payouts', requireAdmin, async (req, res) => {
+  try {
+    const { status } = req.query;
+    let query = supabase
+      .from('payout_requests')
+      .select('*, affiliates(full_name, email, mpesa_number)')
+      .order('created_at', { ascending: false })
+      .limit(parseInt(req.query.limit) || 50);
 
     if (status) {
       query = query.eq('status', status);
