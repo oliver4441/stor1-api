@@ -18,7 +18,12 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false,
 }));
 app.use(cors({
-  origin: ['https://stor1-web.onrender.com', 'http://localhost:5173'],
+  origin: [
+    'https://stor1-web.onrender.com',
+    'https://market.omixsystems.store',
+    'https://omixsystems.store',
+    'http://localhost:5173',
+  ],
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
   credentials: true,
 }));
