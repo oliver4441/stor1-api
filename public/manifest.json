@@ -3,6 +3,7 @@
   "short_name": "Omix",
   "description": "Shop online in Kericho, Kenya. Browse products, add to cart, and pay via M-Pesa.",
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
   "background_color": "#0a0a0a",
   "theme_color": "#1a5632",
