@@ -24,6 +24,9 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '1mb' }));
 
+// Serve built frontend from public/ (same-origin eliminates CORS issues)
+app.use(express.static('public'));
+
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
 const PAYSTACK_PUBLIC = process.env.PAYSTACK_PUBLIC_KEY;
 const OMIX_SUBACCOUNT_CODE = process.env.OMIX_SUBACCOUNT_CODE;
@@ -2415,6 +2418,11 @@ app.post('/api/affiliate/log-click', async (req, res) => {
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
+});
+
+// SPA fallback - serve index.html for non-API routes (after all API routes)
+app.get('*', (req, res) => {
+  res.sendFile('index.html', { root: 'public' });
 });
 
 app.listen(PORT, () => {
