@@ -278,14 +278,16 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
      CREATE INDEX IF NOT EXISTS idx_payout_requests_status ON public.payout_requests(status);`
   );
 
-  // M4.5: Fix missing referral_clicks columns
+  // M4.5: Fix missing referral_clicks columns (table was created without these)
+  // and reload PostgREST schema cache so new columns are visible
   await runSql(
-    'referral_clicks converted column',
-    `ALTER TABLE public.referral_clicks ADD COLUMN IF NOT EXISTS converted BOOLEAN DEFAULT false;`
-  );
-  await runSql(
-    'referral_clicks ip_address column',
-    `ALTER TABLE public.referral_clicks ADD COLUMN IF NOT EXISTS ip_address TEXT;`
+    'referral_clicks missing columns',
+    `ALTER TABLE public.referral_clicks ADD COLUMN IF NOT EXISTS converted BOOLEAN DEFAULT false;
+     ALTER TABLE public.referral_clicks ADD COLUMN IF NOT EXISTS ip_address TEXT;
+     ALTER TABLE public.referral_clicks ADD COLUMN IF NOT EXISTS page_url TEXT;
+     ALTER TABLE public.referral_clicks ADD COLUMN IF NOT EXISTS referral_code TEXT;
+     ALTER TABLE public.referral_clicks ADD COLUMN IF NOT EXISTS user_agent TEXT;
+     NOTIFY pgrst, 'reload schema';`
   );
 
   await runSql(
