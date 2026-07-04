@@ -278,6 +278,12 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
      CREATE INDEX IF NOT EXISTS idx_payout_requests_status ON public.payout_requests(status);`
   );
 
+  // M4.5: Fix missing referral_clicks column
+  await runSql(
+    'referral_clicks converted column',
+    `ALTER TABLE public.referral_clicks ADD COLUMN IF NOT EXISTS converted BOOLEAN DEFAULT false;`
+  );
+
   await runSql(
     'seed affiliate tiers (spec alignment)',
     `DELETE FROM public.affiliate_tiers;
