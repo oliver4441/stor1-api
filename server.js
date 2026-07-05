@@ -60,6 +60,8 @@ app.use((req, res, next) => {
 // Serve built frontend from public/ (same-origin eliminates CORS issues)
 app.use(express.static('public'));
 
+const COMMIT_DEPLOY_TRIGGER = '2026-07-05-deploy-v1';
+
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
 const PAYSTACK_PUBLIC = process.env.PAYSTACK_PUBLIC_KEY;
 const OMIX_SUBACCOUNT_CODE = process.env.OMIX_SUBACCOUNT_CODE;
