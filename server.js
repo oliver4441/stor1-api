@@ -507,6 +507,28 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
      ALTER TABLE public.payout_requests ADD COLUMN IF NOT EXISTS approved_by UUID REFERENCES auth.users(id) ON DELETE SET NULL;`
   );
 
+  // M7: Self-apply support — allow pending/revoked status + application form columns
+  await runSql(
+    'M7: affiliates status constraint update',
+    `ALTER TABLE public.affiliates DROP CONSTRAINT IF EXISTS affiliates_status_check;
+     ALTER TABLE public.affiliates ADD CONSTRAINT affiliates_status_check
+       CHECK (status IN ('pending', 'active', 'inactive', 'revoked'));`
+  );
+
+  await runSql(
+    'M7: affiliates application columns',
+    `ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS alternative_phone TEXT;
+     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS physical_address TEXT;
+     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS id_number TEXT;
+     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS date_of_birth DATE;
+     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS mpesa_account_name TEXT;
+     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS promotional_methods JSONB DEFAULT '[]'::jsonb;
+     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS social_media_handles TEXT;
+     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS how_heard TEXT;
+     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS tier TEXT DEFAULT 'bronze';
+     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS tier_achieved_at TIMESTAMPTZ;`
+  );
+
   console.log('[Migration] All startup migrations completed');
 })();
 
@@ -2151,6 +2173,108 @@ app.post('/api/affiliate/link', requireAuth, async (req, res) => {
 
     res.json({ success: true, data: referral });
   } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 3b. POST /api/affiliates/apply — Submit affiliate application (self-service)
+app.post('/api/affiliates/apply', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+
+    const userId = req.user.id;
+    const {
+      full_name,
+      phone,
+      alternative_phone,
+      email,
+      physical_address,
+      id_number,
+      date_of_birth,
+      mpesa_number,
+      mpesa_account_name,
+      promotional_methods,
+      social_media_handles,
+      how_heard,
+      agreed,
+    } = req.body;
+
+    // ── Validation ──
+    if (!full_name) return res.status(400).json({ success: false, error: 'Full name is required' });
+    if (!phone) return res.status(400).json({ success: false, error: 'Phone number is required' });
+    if (!email) return res.status(400).json({ success: false, error: 'Email is required' });
+    if (!mpesa_number) return res.status(400).json({ success: false, error: 'M-Pesa payout number is required' });
+    if (!agreed) return res.status(400).json({ success: false, error: 'You must agree to the Affiliate Partner Agreement' });
+
+    // Check for existing application for this user
+    const { data: existing } = await supabase
+      .from('affiliates')
+      .select('id, status')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        error: existing.status === 'pending'
+          ? 'You already have a pending application. We will review it shortly.'
+          : 'You are already registered as an affiliate partner.',
+      });
+    }
+
+    // Generate unique referral code
+    const refSuffix = Math.random().toString(36).substring(2, 6).toUpperCase();
+    const referral_code = `AFF-${refSuffix}`;
+
+    const insertData = {
+      user_id: userId,
+      full_name,
+      phone,
+      alternative_phone: alternative_phone || null,
+      email,
+      physical_address: physical_address || null,
+      id_number: id_number || null,
+      date_of_birth: date_of_birth || null,
+      mpesa_number,
+      mpesa_account_name: mpesa_account_name || null,
+      promotional_methods: promotional_methods || [],
+      social_media_handles: social_media_handles || null,
+      how_heard: how_heard || null,
+      referral_code,
+      status: 'pending',
+    };
+
+    const { data: affiliate, error } = await supabase
+      .from('affiliates')
+      .insert(insertData)
+      .select()
+      .single();
+
+    if (error) {
+      // Handle duplicate email gracefully
+      if (error.message?.includes('affiliates_email_key') || error.code === '23505') {
+        return res.status(409).json({
+          success: false,
+          error: 'An affiliate with this email already exists.',
+        });
+      }
+      throw error;
+    }
+
+    // Log the application
+    await supabase.from('affiliate_logs').insert({
+      affiliate_id: affiliate.id,
+      event_type: 'AFFILIATE_APPLIED',
+      details: { source: 'self-service', applied_at: new Date().toISOString() },
+    });
+
+    res.status(201).json({
+      success: true,
+      data: { id: affiliate.id, referral_code, status: 'pending' },
+      message: 'Application submitted successfully. We will review your application and get back to you.',
+    });
+  } catch (err) {
+    console.error('[Affiliate Apply] Error:', err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
