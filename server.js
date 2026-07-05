@@ -11,6 +11,8 @@ import fetch from 'node-fetch';
 import webpush from 'web-push';
 import { createClient } from '@supabase/supabase-js';
 import email from './lib/email.js';
+import rateLimit from 'express-rate-limit';
+import { body, param, validationResult } from 'express-validator';
 
 const app = express();
 app.use(helmet({
@@ -27,7 +29,33 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
   credentials: true,
 }));
+
+// ── Rate Limiting ──
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per window
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later.' }
+});
+app.use('/api/', limiter);
+
 app.use(express.json({ limit: '1mb' }));
+
+// ── XSS Protection: strip HTML tags from request bodies ──
+function sanitize(obj) {
+  for (const key in obj) {
+    if (typeof obj[key] === 'string') {
+      obj[key] = obj[key].replace(/<[^>]*>/g, '');
+    } else if (typeof obj[key] === 'object' && obj[key] !== null) {
+      sanitize(obj[key]);
+    }
+  }
+}
+app.use((req, res, next) => {
+  if (req.body) sanitize(req.body);
+  next();
+});
 
 // Serve built frontend from public/ (same-origin eliminates CORS issues)
 app.use(express.static('public'));
@@ -498,6 +526,101 @@ app.get('/health', (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'omix-api' });
+});
+
+// ── Advanced Search API ─────────────────────────────────────────────
+app.get('/api/search', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+
+    const {
+      q = '',
+      category = '',
+      min_price = 0,
+      max_price = 999999,
+      condition = '',
+      location = '',
+      brand = '',
+      availability = '',
+      page = 1,
+      limit = 20,
+    } = req.query;
+
+    let query = supabase
+      .from('listings')
+      .select('*', { count: 'exact' })
+      .eq('status', 'active');
+
+    // Text search on title and description
+    if (q) {
+      const sanitized = q.replace(/[^a-zA-Z0-9\s\-.]/g, '').trim();
+      if (sanitized.length > 0) {
+        query = query.or(`title.ilike.%${sanitized}%,description.ilike.%${sanitized}%`);
+      }
+    }
+
+    // Category filter
+    if (category) {
+      query = query.eq('category', category);
+    }
+
+    // Price range
+    const minP = parseFloat(min_price) || 0;
+    const maxP = parseFloat(max_price) || 999999;
+    if (minP > 0) query = query.gte('price', minP);
+    if (maxP < 999999) query = query.lte('price', maxP);
+
+    // Condition
+    if (condition) {
+      const conditions = condition.split(',').map(c => c.trim()).filter(Boolean);
+      if (conditions.length === 1) {
+        query = query.eq('condition', conditions[0]);
+      } else if (conditions.length > 1) {
+        query = query.in('condition', conditions);
+      }
+    }
+
+    // Location
+    if (location) {
+      query = query.ilike('location', `%${location}%`);
+    }
+
+    // Brand
+    if (brand) {
+      query = query.ilike('brand', `%${brand}%`);
+    }
+
+    // Availability
+    if (availability === 'in_stock') {
+      query = query.gt('stock_quantity', 0);
+    } else if (availability === 'out_of_stock') {
+      query = query.eq('stock_quantity', 0);
+    }
+
+    // Order by newest first
+    query = query.order('created_at', { ascending: false });
+
+    // Pagination
+    const pageNum = Math.max(1, parseInt(page) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit) || 20));
+    const from = (pageNum - 1) * limitNum;
+    const to = from + limitNum - 1;
+    query = query.range(from, to);
+
+    const { data, error, count } = await query;
+    if (error) throw error;
+
+    res.json({
+      listings: data || [],
+      total: count || 0,
+      page: pageNum,
+      limit: limitNum,
+      total_pages: Math.ceil((count || 0) / limitNum),
+    });
+  } catch (err) {
+    console.error('[Search API] Error:', err.message);
+    res.status(500).json({ error: 'Search failed', details: err.message });
+  }
 });
 
 // ── Nia AI Chat Proxy ──────────────────────────────────────────────
@@ -2422,6 +2545,960 @@ app.post('/api/affiliate/log-click', async (req, res) => {
     res.json({ success: true, data });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Review Management API ──
+
+// GET /api/product-reviews?listing_id=X - Get reviews for a listing (public)
+app.get('/api/product-reviews', async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+
+    const { listing_id } = req.query;
+    if (!listing_id) {
+      return res.status(400).json({ error: 'listing_id query parameter is required' });
+    }
+
+    const { data, error } = await supabase
+      .from('product_reviews')
+      .select(`
+        *,
+        profiles!inner(display_name)
+      `)
+      .eq('listing_id', listing_id)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    res.json({ success: true, data: data || [] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/product-reviews/admin - Get all reviews with listing info (admin only)
+app.get('/api/product-reviews/admin', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+
+    const status = req.query.status;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+
+    let query = supabase
+      .from('product_reviews')
+      .select(`
+        *,
+        profiles!inner(display_name),
+        listings!inner(title)
+      `, { count: 'exact' });
+
+    if (status && ['approved', 'pending', 'flagged'].includes(status)) {
+      query = query.eq('status', status);
+    }
+
+    const { data, error, count } = await query
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (error) throw error;
+    res.json({
+      success: true,
+      data: data || [],
+      pagination: {
+        page,
+        limit,
+        total: count || 0,
+        totalPages: Math.ceil((count || 0) / limit),
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// DELETE /api/product-reviews/:id - Delete a review (admin only)
+app.delete('/api/product-reviews/:id', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('product_reviews')
+      .delete()
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: 'Review not found' });
+      }
+      throw error;
+    }
+
+    res.json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// PATCH /api/product-reviews/:id - Update review status (admin only)
+app.patch('/api/product-reviews/:id', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+
+    const { id } = req.params;
+    const { status } = req.body;
+
+    if (!status || !['approved', 'flagged', 'hidden'].includes(status)) {
+      return res.status(400).json({ error: 'Valid status is required (approved, flagged, or hidden)' });
+    }
+
+    const { data, error } = await supabase
+      .from('product_reviews')
+      .update({ status, updated_at: new Date().toISOString() })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: 'Review not found' });
+      }
+      throw error;
+    }
+
+    res.json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/product-reviews - Submit a review (authenticated)
+app.post('/api/product-reviews',
+  requireAuth,
+  [
+    body('listing_id').notEmpty().withMessage('listing_id is required').isUUID().withMessage('listing_id must be a valid UUID'),
+    body('rating').isInt({ min: 1, max: 5 }).withMessage('rating must be an integer between 1 and 5'),
+    body('review').isString().trim().isLength({ min: 1, max: 2000 }).withMessage('review must be 1-2000 characters'),
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ error: errors.array().map(e => e.msg).join(', ') });
+      }
+
+      if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+
+      const { listing_id, rating, review } = req.body;
+      const userId = req.user.id;
+
+      const { data, error } = await supabase
+        .from('product_reviews')
+        .insert({
+          listing_id,
+          user_id: userId,
+          rating,
+          review: review.trim(),
+          status: 'pending',
+        })
+        .select()
+        .single();
+
+      if (error) throw error;
+      res.json({ success: true, data });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+// ── Flash Deals API ──
+
+// GET /api/flash-deals/active - Get currently active deals with their items
+app.get('/api/flash-deals/active', async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+
+    const { data: deals, error: dErr } = await supabase
+      .from('flash_deals')
+      .select('*')
+      .eq('is_active', true)
+      .lte('start_at', new Date().toISOString())
+      .gte('end_at', new Date().toISOString())
+      .order('created_at', { ascending: false });
+
+    if (dErr) throw dErr;
+
+    if (!deals || deals.length === 0) {
+      return res.json({ success: true, data: [] });
+    }
+
+    // Get items for all active deals
+    const dealIds = deals.map(d => d.id);
+    const { data: items, error: iErr } = await supabase
+      .from('deal_items')
+      .select(`
+        *,
+        listing:listings!inner(title, images, price)
+      `)
+      .in('deal_id', dealIds);
+
+    if (iErr) throw iErr;
+
+    // Group items by deal_id
+    const itemsByDeal = {};
+    for (const item of items || []) {
+      if (!itemsByDeal[item.deal_id]) itemsByDeal[item.deal_id] = [];
+      itemsByDeal[item.deal_id].push(item);
+    }
+
+    const result = deals.map(deal => ({
+      ...deal,
+      items: itemsByDeal[deal.id] || [],
+    }));
+
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/flash-deals - Get all deals (admin only) for management
+app.get('/api/flash-deals', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+
+    const { data, error } = await supabase
+      .from('flash_deals')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    // Get items for all deals
+    const dealIds = (data || []).map(d => d.id);
+    if (dealIds.length > 0) {
+      const { data: items, error: iErr } = await supabase
+        .from('deal_items')
+        .select('*')
+        .in('deal_id', dealIds);
+
+      if (!iErr && items) {
+        const itemsByDeal = {};
+        for (const item of items) {
+          if (!itemsByDeal[item.deal_id]) itemsByDeal[item.deal_id] = [];
+          itemsByDeal[item.deal_id].push(item);
+        }
+        for (const deal of data) {
+          deal.items = itemsByDeal[deal.id] || [];
+        }
+      }
+    }
+
+    res.json({ success: true, data: data || [] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/flash-deals - Create deal (admin only)
+app.post('/api/flash-deals', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+
+    const { title, description, banner_url, start_at, end_at, is_active } = req.body;
+
+    if (!title || !start_at || !end_at) {
+      return res.status(400).json({ error: 'title, start_at, and end_at are required' });
+    }
+
+    const { data, error } = await supabase
+      .from('flash_deals')
+      .insert({
+        title,
+        description: description || null,
+        banner_url: banner_url || null,
+        start_at,
+        end_at,
+        is_active: is_active !== undefined ? is_active : true,
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.status(201).json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// PUT /api/flash-deals/:id - Update deal (admin only)
+app.put('/api/flash-deals/:id', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+
+    const { id } = req.params;
+    const { title, description, banner_url, start_at, end_at, is_active } = req.body;
+
+    const updates = {};
+    if (title !== undefined) updates.title = title;
+    if (description !== undefined) updates.description = description;
+    if (banner_url !== undefined) updates.banner_url = banner_url;
+    if (start_at !== undefined) updates.start_at = start_at;
+    if (end_at !== undefined) updates.end_at = end_at;
+    if (is_active !== undefined) updates.is_active = is_active;
+
+    const { data, error } = await supabase
+      .from('flash_deals')
+      .update(updates)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// DELETE /api/flash-deals/:id - Delete deal (admin only)
+app.delete('/api/flash-deals/:id', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+
+    const { id } = req.params;
+
+    // Delete items first (CASCADE should handle this, but be explicit)
+    await supabase.from('deal_items').delete().eq('deal_id', id);
+
+    const { error } = await supabase
+      .from('flash_deals')
+      .delete()
+      .eq('id', id);
+
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/deal-items - Add item to deal (admin only)
+app.post('/api/deal-items', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+
+    const { deal_id, listing_id, deal_price, discount_percent, max_quantity } = req.body;
+
+    if (!deal_id || !listing_id) {
+      return res.status(400).json({ error: 'deal_id and listing_id are required' });
+    }
+
+    const { data, error } = await supabase
+      .from('deal_items')
+      .insert({
+        deal_id,
+        listing_id,
+        deal_price: deal_price || null,
+        discount_percent: discount_percent || null,
+        max_quantity: max_quantity || 0,
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.status(201).json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// DELETE /api/deal-items/:id - Remove item from deal (admin only)
+app.delete('/api/deal-items/:id', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+
+    const { id } = req.params;
+    const { error } = await supabase
+      .from('deal_items')
+      .delete()
+      .eq('id', id);
+
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Chat / Messages API ──
+
+// GET /api/conversations - list conversations for the current user (admin sees all, buyer sees own)
+app.get('/api/conversations', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    const userId = req.user.id;
+
+    // Check if user is admin
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('role')
+      .eq('id', userId)
+      .single();
+
+    // Get conversation IDs this user participates in (admin sees all)
+    let partQuery = supabase
+      .from('conversation_participants')
+      .select('conversation_id');
+
+    if (!profile || profile.role !== 'admin') {
+      partQuery = partQuery.eq('user_id', userId);
+    }
+
+    const { data: participations, error: partErr } = await partQuery;
+    if (partErr) throw partErr;
+
+    const convIds = [...new Set((participations || []).map(p => p.conversation_id))];
+    if (convIds.length === 0) {
+      return res.json({ success: true, data: [] });
+    }
+
+    const { data, error } = await supabase
+      .from('conversations')
+      .select('*')
+      .in('id', convIds)
+      .order('last_message_at', { ascending: false, nulls: 'last' });
+
+    if (error) throw error;
+
+    res.json({ success: true, data: data || [] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/conversations - create a new conversation
+app.post('/api/conversations', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    const userId = req.user.id;
+    const { participant_id, subject } = req.body;
+
+    if (!participant_id) {
+      return res.status(400).json({ error: 'participant_id is required' });
+    }
+
+    if (participant_id === userId) {
+      return res.status(400).json({ error: 'Cannot create conversation with yourself' });
+    }
+
+    // Validate participant exists
+    const { data: participant, error: pErr } = await supabase
+      .from('profiles')
+      .select('id')
+      .eq('id', participant_id)
+      .single();
+
+    if (pErr || !participant) {
+      return res.status(404).json({ error: 'Participant not found' });
+    }
+
+    // Create the conversation
+    const { data: conv, error: cErr } = await supabase
+      .from('conversations')
+      .insert({
+        subject: (subject || '').toString().substring(0, 255),
+        created_by: userId,
+      })
+      .select()
+      .single();
+
+    if (cErr) throw cErr;
+
+    // Add both participants
+    const { error: cpErr } = await supabase
+      .from('conversation_participants')
+      .insert([
+        { conversation_id: conv.id, user_id: userId },
+        { conversation_id: conv.id, user_id: participant_id },
+      ]);
+
+    if (cpErr) throw cpErr;
+
+    res.status(201).json({ success: true, data: conv });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/conversations/unread-count - get unread count for current user
+app.get('/api/conversations/unread-count', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    const userId = req.user.id;
+
+    const { count, error } = await supabase
+      .from('messages')
+      .select('*', { count: 'exact', head: true })
+      .neq('sender_id', userId)
+      .is('read_at', null);
+
+    if (error) throw error;
+
+    res.json({ success: true, count });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/conversations/:id/messages - get messages for a conversation
+app.get('/api/conversations/:id/messages', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    const userId = req.user.id;
+    const conversationId = req.params.id;
+
+    // Verify user is a participant
+    const { data: part, error: pErr } = await supabase
+      .from('conversation_participants')
+      .select('id')
+      .eq('conversation_id', conversationId)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (pErr) throw pErr;
+    if (!part) {
+      return res.status(403).json({ error: 'Not a participant of this conversation' });
+    }
+
+    const { data, error } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('conversation_id', conversationId)
+      .order('created_at', { ascending: true });
+
+    if (error) throw error;
+
+    res.json({ success: true, data: data || [] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/conversations/:id/messages - send a message in a conversation
+app.post('/api/conversations/:id/messages', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    const userId = req.user.id;
+    const conversationId = req.params.id;
+    const { content } = req.body;
+
+    if (!content || !content.toString().trim()) {
+      return res.status(400).json({ error: 'Message content is required' });
+    }
+
+    // Verify user is a participant
+    const { data: part, error: pErr } = await supabase
+      .from('conversation_participants')
+      .select('id')
+      .eq('conversation_id', conversationId)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (pErr) throw pErr;
+    if (!part) {
+      return res.status(403).json({ error: 'Not a participant of this conversation' });
+    }
+
+    const contentStr = content.toString().substring(0, 5000);
+
+    const { data, error } = await supabase
+      .from('messages')
+      .insert({
+        conversation_id: conversationId,
+        sender_id: userId,
+        content: contentStr,
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    // Update conversation metadata
+    const preview = contentStr.substring(0, 100);
+    await supabase
+      .from('conversations')
+      .update({
+        last_message_at: new Date().toISOString(),
+        last_message_preview: preview,
+      })
+      .eq('id', conversationId);
+
+    res.status(201).json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// PATCH /api/conversations/:id/read - mark all messages in conversation as read for current user
+app.patch('/api/conversations/:id/read', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    const userId = req.user.id;
+    const conversationId = req.params.id;
+
+    // Verify user is a participant
+    const { data: part, error: pErr } = await supabase
+      .from('conversation_participants')
+      .select('id')
+      .eq('conversation_id', conversationId)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (pErr) throw pErr;
+    if (!part) {
+      return res.status(403).json({ error: 'Not a participant of this conversation' });
+    }
+
+    // Mark unread messages from other users as read
+    const { data, error } = await supabase
+      .from('messages')
+      .update({ read_at: new Date().toISOString() })
+      .eq('conversation_id', conversationId)
+      .neq('sender_id', userId)
+      .is('read_at', null)
+      .select();
+
+    if (error) throw error;
+
+    res.json({ success: true, data, updated: (data || []).length });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Store Profile API ──────────────────────────────────────────────────
+// GET /api/store/profile - Public, returns store settings
+app.get('/api/store/profile', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+
+    const { data, error } = await supabase
+      .from('store_settings')
+      .select('*')
+      .limit(1)
+      .maybeSingle();
+
+    if (error) throw error;
+
+    if (!data) {
+      // Return defaults if no row exists yet
+      return res.json({
+        store_name: 'Omix Store',
+        tagline: "Kericho's Premier Tech Marketplace",
+        description: 'Omix Store is Kericho\'s trusted destination for quality electronics and gadgets.',
+        logo_url: '',
+        banner_url: '',
+        phone: '+254 768 213 649',
+        email: 'omixsystems@gmail.com',
+        address: 'Kericho, Kenya',
+        whatsapp: '+254 768 213 649',
+        total_orders: 0,
+        satisfaction_rate: 0,
+        member_since: '2024-01-15',
+        response_time: 'Under 1 hour',
+        is_verified: true,
+      });
+    }
+
+    res.json(data);
+  } catch (err) {
+    console.error('[Store Profile] GET error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch store profile', details: err.message });
+  }
+});
+
+// PUT /api/store/profile - Admin only, update store settings
+app.put('/api/store/profile', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+
+    const allowedFields = [
+      'store_name', 'tagline', 'description', 'logo_url', 'banner_url',
+      'phone', 'email', 'address', 'whatsapp',
+      'total_orders', 'satisfaction_rate', 'response_time', 'is_verified',
+    ];
+
+    const updates = {};
+    for (const field of allowedFields) {
+      if (req.body[field] !== undefined) {
+        updates[field] = req.body[field];
+      }
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No valid fields to update' });
+    }
+
+    // Get the first row's ID
+    const { data: existing } = await supabase
+      .from('store_settings')
+      .select('id')
+      .limit(1)
+      .maybeSingle();
+
+    if (!existing) {
+      // Insert first row with updates merged with defaults
+      const insertData = {
+        store_name: 'Omix Store',
+        tagline: "Kericho's Premier Tech Marketplace",
+        ...updates,
+      };
+      const { data: inserted, error: insertError } = await supabase
+        .from('store_settings')
+        .insert(insertData)
+        .select()
+        .single();
+
+      if (insertError) throw insertError;
+      return res.json(inserted);
+    }
+
+    const { data, error } = await supabase
+      .from('store_settings')
+      .update(updates)
+      .eq('id', existing.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json(data);
+  } catch (err) {
+    console.error('[Store Profile] PUT error:', err.message);
+    res.status(500).json({ error: 'Failed to update store profile', details: err.message });
+  }
+});
+
+// ── Tracking Events API ──────────────────────────────────────────────
+
+// GET /api/orders/:id/tracking - Return tracking events for an order, ordered by created_at ASC
+app.get('/api/orders/:id/tracking', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('tracking_events')
+      .select('*')
+      .eq('order_id', id)
+      .order('created_at', { ascending: true });
+
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) {
+    console.error('[Tracking] GET error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch tracking events', details: err.message });
+  }
+});
+
+// POST /api/admin/orders/:id/status - Admin updates order status + creates tracking event
+app.post('/api/admin/orders/:id/status',
+  requireAdmin,
+  [
+    param('id').isUUID().withMessage('Order ID must be a valid UUID'),
+    body('status').isString().notEmpty().isIn(['pending', 'processing', 'shipped', 'delivered', 'cancelled'])
+      .withMessage('Status must be one of: pending, processing, shipped, delivered, cancelled'),
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ error: errors.array().map(e => e.msg).join(', ') });
+      }
+
+      if (!supabase) return res.status(503).json({ error: 'Database not available' });
+
+      const { id } = req.params;
+      const { status, note } = req.body;
+
+      const validStatuses = ['pending', 'cod_pending', 'processing', 'shipped', 'delivered', 'cancelled'];
+      if (!validStatuses.includes(status)) {
+        return res.status(400).json({ error: `Invalid status. Must be one of: ${validStatuses.join(', ')}` });
+      }
+
+    // Update the order status
+    const { error: orderError } = await supabase
+      .from('omix_orders')
+      .update({ status, updated_at: new Date().toISOString() })
+      .eq('id', id);
+
+    if (orderError) throw orderError;
+
+    // Create a tracking event
+    const { error: trackingError } = await supabase
+      .from('tracking_events')
+      .insert({
+        order_id: id,
+        status,
+        note: note || null,
+      });
+
+    if (trackingError) throw trackingError;
+
+    console.log(`[Tracking] Order ${id.slice(0, 8)} status updated to ${status}`);
+    res.json({ success: true, status, note: note || null });
+  } catch (err) {
+    console.error('[Tracking] POST admin error:', err.message);
+    res.status(500).json({ error: 'Failed to update order status', details: err.message });
+  }
+});
+
+// ── Product Recommendations ──────────────────────────────────────
+
+// GET /api/products/:id/recommendations - Up to 6 same-category listings, excluding current
+app.get('/api/products/:id/recommendations', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { id } = req.params;
+
+    // Look up the product's category
+    const { data: product, error: productErr } = await supabase
+      .from('listings')
+      .select('category_id, category')
+      .eq('id', id)
+      .single();
+
+    if (productErr || !product) {
+      // Fallback: random active listings
+      const { data: fallback } = await supabase
+        .from('listings')
+        .select('id, title, price, images, slug, category')
+        .eq('status', 'active')
+        .limit(6);
+      return res.json({ recommendations: fallback || [] });
+    }
+
+    const categoryId = product.category_id;
+    const categoryName = product.category;
+
+    // Get total count of same-category listings (excluding current)
+    let countQuery = supabase
+      .from('listings')
+      .select('id', { count: 'exact', head: true })
+      .eq('status', 'active')
+      .neq('id', id);
+
+    if (categoryId != null) {
+      countQuery = countQuery.eq('category_id', categoryId);
+    } else if (categoryName) {
+      countQuery = countQuery.eq('category', categoryName);
+    }
+
+    const { count } = await countQuery;
+
+    if (!count || count === 0) {
+      // Fallback: random active listings
+      const { data: fallback } = await supabase
+        .from('listings')
+        .select('id, title, price, images, slug, category')
+        .eq('status', 'active')
+        .limit(6);
+      return res.json({ recommendations: fallback || [] });
+    }
+
+    // Pick 6 random listings from the pool using random offset
+    const limit = Math.min(count, 6);
+    const maxStart = count - limit;
+    const start = maxStart > 0 ? Math.floor(Math.random() * (maxStart + 1)) : 0;
+
+    let query = supabase
+      .from('listings')
+      .select('id, title, price, images, slug, category')
+      .eq('status', 'active')
+      .neq('id', id);
+
+    if (categoryId != null) {
+      query = query.eq('category_id', categoryId);
+    } else if (categoryName) {
+      query = query.eq('category', categoryName);
+    }
+
+    query = query.order('id', { ascending: true }).range(start, start + limit - 1);
+
+    const { data } = await query;
+    return res.json({ recommendations: data || [] });
+  } catch (err) {
+    console.error('[Recommendations] Error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch recommendations', details: err.message });
+  }
+});
+
+// GET /api/recommendations/trending - Top 6 most ordered products (30 days)
+app.get('/api/recommendations/trending', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - 30);
+    const cutoffISO = cutoff.toISOString();
+
+    // Aggregate order items by product_id, count occurrences
+    const { data: orderItems, error: itemsErr } = await supabase
+      .from('omix_order_items')
+      .select('product_id, quantity')
+      .gte('created_at', cutoffISO);
+
+    if (itemsErr) throw itemsErr;
+
+    if (orderItems && orderItems.length > 0) {
+      // Count orders per product
+      const productCounts = {};
+      orderItems.forEach(item => {
+        const pid = item.product_id;
+        if (pid) {
+          productCounts[pid] = (productCounts[pid] || 0) + (parseInt(item.quantity) || 1);
+        }
+      });
+
+      // Sort by count descending, take top 6
+      const topIds = Object.entries(productCounts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 6)
+        .map(([id]) => id);
+
+      if (topIds.length > 0) {
+        const { data: products } = await supabase
+          .from('listings')
+          .select('id, title, price, images, slug, category')
+          .in('id', topIds)
+          .eq('status', 'active');
+
+        if (products && products.length > 0) {
+          // Preserve the trending order
+          const sorted = topIds
+            .map(id => products.find(p => String(p.id) === String(id)))
+            .filter(Boolean);
+          return res.json({ recommendations: sorted });
+        }
+      }
+    }
+
+    // Fallback: random active listings
+    const { data: fallback } = await supabase
+      .from('listings')
+      .select('id, title, price, images, slug, category')
+      .eq('status', 'active')
+      .limit(6);
+
+    return res.json({ recommendations: fallback || [] });
+  } catch (err) {
+    console.error('[Recommendations] Trending error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch trending', details: err.message });
   }
 });
 
