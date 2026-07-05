@@ -60,7 +60,10 @@ app.use((req, res, next) => {
 // Serve built frontend from public/ (same-origin eliminates CORS issues)
 app.use(express.static('public'));
 
-const COMMIT_DEPLOY_TRIGGER = '2026-07-05-deploy-v1';
+// Warn if CRON_SECRET not set (commission calculation cron requires it)
+if (!process.env.CRON_SECRET) {
+  console.warn('CRON_SECRET not set — /api/admin/commissions/calculate requires env var to work via HTTP');
+}
 
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
 const PAYSTACK_PUBLIC = process.env.PAYSTACK_PUBLIC_KEY;
