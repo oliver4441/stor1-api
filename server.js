@@ -512,7 +512,7 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
     'M7: affiliates status constraint update',
     `ALTER TABLE public.affiliates DROP CONSTRAINT IF EXISTS affiliates_status_check;
      ALTER TABLE public.affiliates ADD CONSTRAINT affiliates_status_check
-       CHECK (status IN ('pending', 'active', 'inactive', 'revoked'));`
+       CHECK (status IN ('pending', 'active', 'inactive', 'revoked', 'terminated'));`
   );
 
   await runSql(
