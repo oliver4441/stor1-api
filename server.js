@@ -64,7 +64,6 @@ const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
 const PAYSTACK_PUBLIC = process.env.PAYSTACK_PUBLIC_KEY;
 const OMIX_SUBACCOUNT_CODE = process.env.OMIX_SUBACCOUNT_CODE;
 const PORT = process.env.PORT || 3001;
-const CRON_SECRET_FALLBACK = '75St3YYb2d519_m0_ifZoFxF7sp-8YUYgZAPYYWiy8Q';
 
 // VAPID keys for web push
 const VAPID_PUBLIC_KEY = process.env.VITE_VAPID_PUBLIC_KEY || process.env.VAPID_PUBLIC_KEY || '';
@@ -851,7 +850,7 @@ app.post('/api/nia/chat', async (req, res) => {
 });
 
 // ── Initialize Paystack Inline Payment ─────────────────────────────────────────
-app.post('/api/paystack/initialize', async (req, res) => {
+app.post('/api/paystack/initialize', requireAuth, async (req, res) => {
   if (!PAYSTACK_SECRET) return res.status(503).json({ message: 'Payment service not configured' });
   try {
     // Check maintenance mode first (if Supabase is available)
@@ -1322,7 +1321,7 @@ app.post('/api/push/send', requireApiKey, async (req, res) => {
 });
 
 // ── Admin SQL endpoint (temporary — delete after migrations applied) ──
-app.post('/api/admin/sql', requireApiKey, async (req, res) => {
+app.post('/api/admin/sql', requireAdmin, async (req, res) => {
   if (!supabase) return res.status(500).json({ message: 'Supabase not configured' });
   const { query } = req.body;
   if (!query || typeof query !== 'string') return res.status(400).json({ message: 'query required' });
@@ -1344,7 +1343,7 @@ app.post('/api/admin/sql', requireApiKey, async (req, res) => {
 });
 
 // ── Admin Analytics Endpoint ──────────────────────────────────
-app.get('/api/admin/analytics', requireApiKey, async (req, res) => {
+app.get('/api/admin/analytics', requireAdmin, async (req, res) => {
   if (!supabase) return res.status(500).json({ message: 'Supabase not configured' });
 
   try {
@@ -1741,7 +1740,7 @@ app.post('/api/admin/commissions/calculate', async (req, res) => {
   try {
     // Allow cron key auth for scheduled jobs
     const cronKey = req.query.key;
-    const cronSecret = process.env.CRON_SECRET || CRON_SECRET_FALLBACK;
+    const cronSecret = process.env.CRON_SECRET;
     if (cronKey && cronKey === cronSecret) {
       await handleCommissionCalc(req, res);
     } else {
