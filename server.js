@@ -57,8 +57,8 @@ app.use((req, res, next) => {
   next();
 });
 
-// Serve built frontend from public/ (same-origin eliminates CORS issues)
-app.use(express.static('public'));
+// Static assets are served by the frontend service (stor1-web)
+// API-only: no static file serving
 
 // Warn if CRON_SECRET not set (commission calculation cron requires it)
 if (!process.env.CRON_SECRET) {
@@ -3630,10 +3630,7 @@ app.get('/api/recommendations/trending', async (req, res) => {
   }
 });
 
-// SPA fallback - serve index.html for non-API routes (after all API routes)
-app.get('*', (req, res) => {
-  res.sendFile('index.html', { root: 'public' });
-});
+// API-only: no SPA fallback — unmatched routes return 404 JSON
 
 app.listen(PORT, () => {
   console.log(`🚀 Omix API server running on port ${PORT}`);
