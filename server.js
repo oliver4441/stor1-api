@@ -11,7 +11,7 @@ import fetch from 'node-fetch';
 import webpush from 'web-push';
 import { createClient } from '@supabase/supabase-js';
 import { InferenceClient } from '@huggingface/inference';
-import email from './lib/email.js';
+import emailLib from './lib/email.js';
 import rateLimit from 'express-rate-limit';
 import { body, param, validationResult } from 'express-validator';
 
@@ -1073,7 +1073,7 @@ app.post('/api/paystack/webhook', express.raw({ type: 'application/json' }), asy
               name: item.product_name + (item.variant?.size ? ` (${item.variant.size})` : '') + (item.variant?.colorName ? ` — ${item.variant.colorName}` : ''),
             }));
 
-            email.sendOrderConfirmation({
+            emailLib.sendOrderConfirmation({
               to: existing.email,
               orderId: existing.id,
               items: itemsForEmail,
@@ -1111,7 +1111,7 @@ app.post('/api/paystack/webhook', express.raw({ type: 'application/json' }), asy
 
           // Send payment failure email
           if (existing?.email) {
-            email.sendPaymentFailed({
+            emailLib.sendPaymentFailed({
               to: existing.email,
               orderId: existing.id,
               customerName: existing.customer_name,
@@ -1151,7 +1151,7 @@ app.post('/api/email/welcome', requireApiKey, async (req, res) => {
     const { to, name } = req.body;
     if (!to) return res.status(400).json({ message: 'Email address required' });
 
-    const result = await email.sendWelcomeEmail({ to, name });
+    const result = await emailLib.sendWelcomeEmail({ to, name });
     res.json({ success: result.sent, message: result.sent ? 'Welcome email sent' : 'Welcome email skipped (no API key)' });
   } catch (err) {
     res.status(500).json({ message: 'Failed to send welcome email', error: err.message });
@@ -1164,7 +1164,7 @@ app.post('/api/email/referral-reward', requireApiKey, async (req, res) => {
     const { to, referralCode, rewardAmount, customerName } = req.body;
     if (!to) return res.status(400).json({ message: 'Email address required' });
 
-    const result = await email.sendReferralReward({ to, referralCode, rewardAmount, customerName });
+    const result = await emailLib.sendReferralReward({ to, referralCode, rewardAmount, customerName });
     res.json({ success: result.sent, message: result.sent ? 'Referral reward email sent' : 'Referral reward email skipped (no API key)' });
   } catch (err) {
     res.status(500).json({ message: 'Failed to send referral reward email', error: err.message });
@@ -1177,7 +1177,7 @@ app.post('/api/email/order-status', requireApiKey, async (req, res) => {
     const { to, orderId, status, customerName } = req.body;
     if (!to) return res.status(400).json({ message: 'Email address required' });
 
-    const result = await email.sendOrderStatusUpdate({ to, orderId, status, customerName });
+    const result = await emailLib.sendOrderStatusUpdate({ to, orderId, status, customerName });
     res.json({ success: result.sent, message: result.sent ? 'Order status email sent' : 'Order status email skipped (no API key)' });
   } catch (err) {
     res.status(500).json({ message: 'Failed to send order status email', error: err.message });
@@ -1190,7 +1190,7 @@ app.post('/api/email/price-drop', requireApiKey, async (req, res) => {
     const { to, productName, productUrl, oldPrice, newPrice, productImage } = req.body;
     if (!to) return res.status(400).json({ message: 'Email address required' });
 
-    const result = await email.sendPriceDropAlert({ to, productName, productUrl, oldPrice, newPrice, productImage });
+    const result = await emailLib.sendPriceDropAlert({ to, productName, productUrl, oldPrice, newPrice, productImage });
     res.json({ success: result.sent, message: result.sent ? 'Price drop alert sent' : 'Price drop alert skipped (no API key)' });
   } catch (err) {
     res.status(500).json({ message: 'Failed to send price drop alert', error: err.message });
@@ -1203,7 +1203,7 @@ app.post('/api/email/back-in-stock', requireApiKey, async (req, res) => {
     const { to, productName, productUrl, price } = req.body;
     if (!to) return res.status(400).json({ message: 'Email address required' });
 
-    const result = await email.sendBackInStockAlert({ to, productName, productUrl, price });
+    const result = await emailLib.sendBackInStockAlert({ to, productName, productUrl, price });
     res.json({ success: result.sent, message: result.sent ? 'Back in stock alert sent' : 'Back in stock alert skipped (no API key)' });
   } catch (err) {
     res.status(500).json({ message: 'Failed to send back in stock alert', error: err.message });
@@ -1216,7 +1216,7 @@ app.post('/api/email/abandoned-cart', requireApiKey, async (req, res) => {
     const { to, items, total, customerName } = req.body;
     if (!to) return res.status(400).json({ message: 'Email address required' });
 
-    const result = await email.sendAbandonedCartReminder({ to, items, total, customerName });
+    const result = await emailLib.sendAbandonedCartReminder({ to, items, total, customerName });
     res.json({ success: result.sent, message: result.sent ? 'Abandoned cart reminder sent' : 'Abandoned cart reminder skipped (no API key)' });
   } catch (err) {
     res.status(500).json({ message: 'Failed to send abandoned cart reminder', error: err.message });
@@ -1739,7 +1739,7 @@ app.patch('/api/admin/affiliates/:id/approve', requireAdmin, async (req, res) =>
       const affiliateData = affiliate;
       if (action === 'approve') {
         // Send approval email
-        email.sendAffiliateApproved({
+        emailLib.sendAffiliateApproved({
           to: affiliateData.email,
           name: affiliateData.full_name,
           referralCode: affiliateData.referral_code,
@@ -1757,7 +1757,7 @@ app.patch('/api/admin/affiliates/:id/approve', requireAdmin, async (req, res) =>
         });
       } else {
         // Send rejection email
-        email.sendAffiliateRejected({
+        emailLib.sendAffiliateRejected({
           to: affiliateData.email,
           name: affiliateData.full_name,
         });
@@ -2375,7 +2375,7 @@ app.post('/api/affiliates/apply', async (req, res) => {
 
     // Send credentials email (async — don't block response)
     if (password) {
-      email.sendAffiliateCredentials({
+      emailLib.sendAffiliateCredentials({
         to: email,
         name: full_name,
         email: email,
