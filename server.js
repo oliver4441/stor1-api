@@ -709,10 +709,24 @@ const NIA_MODELS = [
 
 app.post('/api/nia/chat', async (req, res) => {
   const apiKey = process.env.OPENCODE_API_KEY;
-  if (!apiKey) return res.status(503).json({ error: 'AI service not configured' });
 
   const { messages, userId, pageContext, cartItems } = req.body;
   if (!messages || !Array.isArray(messages)) return res.status(400).json({ error: 'Messages required' });
+
+  // If no API key, return simple fallback response directly (no 503 error)
+  if (!apiKey) {
+    const lastMsg = messages.filter(m => m.role === 'user').pop()?.content?.toLowerCase() || '';
+    const isSwahili = /jambo|habari|naomba|nataka|bei|pesa|shilingi|asante|ndio|hapana|nini|wapi|vipi|ngapi|saa|oda|malipo|usafirishaji/i.test(lastMsg);
+    let responseText;
+    if (isSwahili) {
+      responseText = 'Habari! Mimi ni Nia, msaidizi wako wa Omix Store. Ninaweza kukusaidia kutafuta bidhaa, kuangalia oda zako, au kujua jinsi duka letu linavyofanya kazi. Una swali gani leo?';
+    } else if (/hello|hi|hey|good morning|good evening/i.test(lastMsg)) {
+      responseText = 'Hello! I\'m Nia, your Omix Store assistant. I can help you browse products, track orders, or learn how the store works. What would you like to know?';
+    } else {
+      responseText = 'Hi there! I\'m Nia, the Omix Store assistant. Feel free to ask me about our products, your orders, or how to use the store. How can I help you today?';
+    }
+    return res.json({ content: responseText });
+  }
 
   // Build dynamic context
   let contextPrompt = NIA_SYSTEM_PROMPT;
@@ -2690,14 +2704,29 @@ app.get('/api/product-reviews', async (req, res) => {
 
     const { data, error } = await supabase
       .from('product_reviews')
-      .select(`
-        *,
-        profiles!inner(display_name)
-      `)
+      .select(`*`)
       .eq('listing_id', listing_id)
       .order('created_at', { ascending: false });
 
     if (error) throw error;
+
+    // Fetch display names for each review's user_id
+    if (data && data.length > 0) {
+      const userIds = [...new Set(data.map(r => r.user_id))];
+      const { data: profiles, error: pErr } = await supabase
+        .from('profiles')
+        .select('id, display_name')
+        .in('id', userIds);
+      if (!pErr && profiles) {
+        const nameMap = Object.fromEntries(profiles.map(p => [p.id, p.display_name]));
+        data.forEach(r => {
+          r.display_name = nameMap[r.user_id] || 'Anonymous';
+        });
+      } else {
+        data.forEach(r => { r.display_name = 'Anonymous'; });
+      }
+    }
+
     res.json({ success: true, data: data || [] });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -2716,11 +2745,7 @@ app.get('/api/product-reviews/admin', requireAdmin, async (req, res) => {
 
     let query = supabase
       .from('product_reviews')
-      .select(`
-        *,
-        profiles!inner(display_name),
-        listings!inner(title)
-      `, { count: 'exact' });
+      .select(`*`, { count: 'exact' });
 
     if (status && ['approved', 'pending', 'flagged'].includes(status)) {
       query = query.eq('status', status);
@@ -2731,6 +2756,29 @@ app.get('/api/product-reviews/admin', requireAdmin, async (req, res) => {
       .range(offset, offset + limit - 1);
 
     if (error) throw error;
+
+    // Enrich with display names and listing titles
+    if (data && data.length > 0) {
+      const userIds = [...new Set(data.map(r => r.user_id))];
+      const listingIds = [...new Set(data.map(r => r.listing_id))];
+      const [profilesRes, listingsRes] = await Promise.allSettled([
+        supabase.from('profiles').select('id, display_name').in('id', userIds),
+        supabase.from('listings').select('id, title').in('id', listingIds),
+      ]);
+      const nameMap = {};
+      if (profilesRes.status === 'fulfilled' && profilesRes.value.data) {
+        profilesRes.value.data.forEach(p => { nameMap[p.id] = p.display_name; });
+      }
+      const titleMap = {};
+      if (listingsRes.status === 'fulfilled' && listingsRes.value.data) {
+        listingsRes.value.data.forEach(l => { titleMap[l.id] = l.title; });
+      }
+      data.forEach(r => {
+        r.display_name = nameMap[r.user_id] || 'Anonymous';
+        r.listing_title = titleMap[r.listing_id] || 'Unknown';
+      });
+    }
+
     res.json({
       success: true,
       data: data || [],
