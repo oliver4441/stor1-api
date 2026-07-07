@@ -1734,6 +1734,49 @@ app.patch('/api/admin/affiliates/:id/approve', requireAdmin, async (req, res) =>
       details: { action, notes, processed_by: req.user.id },
     });
 
+    // ── Send email & in-app notification ──
+    try {
+      const affiliateData = affiliate;
+      if (action === 'approve') {
+        // Send approval email
+        email.sendAffiliateApproved({
+          to: affiliateData.email,
+          name: affiliateData.full_name,
+          referralCode: affiliateData.referral_code,
+          dashboardUrl: `${process.env.FRONTEND_URL || 'https://stor1-web.onrender.com'}/affiliate-dashboard`,
+        });
+
+        // In-app notification
+        await supabase.from('in_app_notifications').insert({
+          user_id: affiliateData.user_id,
+          type: 'AFFILIATE_APPROVED',
+          title: 'Affiliate Application Approved',
+          body: `Congratulations ${affiliateData.full_name}! Your affiliate application has been approved. Start earning commissions now.`,
+          url: '/affiliate-dashboard',
+          tag: 'affiliate',
+        });
+      } else {
+        // Send rejection email
+        email.sendAffiliateRejected({
+          to: affiliateData.email,
+          name: affiliateData.full_name,
+        });
+
+        // In-app notification
+        await supabase.from('in_app_notifications').insert({
+          user_id: affiliateData.user_id,
+          type: 'AFFILIATE_REJECTED',
+          title: 'Affiliate Application Update',
+          body: `Your affiliate application has been reviewed. Please check your email for more details.`,
+          url: null,
+          tag: 'affiliate',
+        });
+      }
+    } catch (notifErr) {
+      console.error('[Affiliate Notify] Failed to send notification:', notifErr.message);
+      // Non-blocking - do not fail the request
+    }
+
     res.json({ success: true, affiliate });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
