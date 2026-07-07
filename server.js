@@ -2227,16 +2227,17 @@ app.post('/api/affiliate/link', requireAuth, async (req, res) => {
 });
 
 // 3b. POST /api/affiliates/apply — Submit affiliate application (self-service)
-app.post('/api/affiliates/apply', requireAuth, async (req, res) => {
+// Supports both logged-in users and new users signing up with a password
+app.post('/api/affiliates/apply', async (req, res) => {
   try {
     if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
 
-    const userId = req.user.id;
     const {
       full_name,
       phone,
       alternative_phone,
       email,
+      password,
       physical_address,
       id_number,
       date_of_birth,
@@ -2254,6 +2255,57 @@ app.post('/api/affiliates/apply', requireAuth, async (req, res) => {
     if (!email) return res.status(400).json({ success: false, error: 'Email is required' });
     if (!mpesa_number) return res.status(400).json({ success: false, error: 'M-Pesa payout number is required' });
     if (!agreed) return res.status(400).json({ success: false, error: 'You must agree to the Affiliate Partner Agreement' });
+
+    // ── Resolve user — either from auth header or create new account ──
+    let userId = null;
+
+    // Check for existing auth token
+    const authHeader = req.headers.authorization;
+    if (authHeader?.startsWith('Bearer ')) {
+      const token = authHeader.slice(7);
+      const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+      if (!authError && user) {
+        userId = user.id;
+      }
+    }
+
+    // If no authenticated user, create one via admin API (requires password)
+    if (!userId) {
+      if (!password || password.length < 6) {
+        return res.status(400).json({
+          success: false,
+          error: 'Password is required and must be at least 6 characters long.',
+        });
+      }
+
+      const { data: newUser, error: createError } = await supabase.auth.admin.createUser({
+        email,
+        password,
+        email_confirm: true,
+        user_metadata: { full_name },
+      });
+
+      if (createError) {
+        if (createError.message?.includes('already') || createError.code === 'email_exists') {
+          return res.status(409).json({
+            success: false,
+            error: 'An account with this email already exists. Please sign in and then apply.',
+          });
+        }
+        console.error('[Affiliate Apply] User creation error:', createError.message);
+        return res.status(500).json({ success: false, error: 'Failed to create account. Please try again.' });
+      }
+
+      userId = newUser.user.id;
+
+      // Create profile entry for the new user
+      await supabase.from('profiles').insert({
+        id: userId,
+        email: email,
+        full_name: full_name,
+        role: 'user',
+      }).catch(err => console.error('[Affiliate] Profile insert error:', err.message));
+    }
 
     // Check for existing application for this user
     const { data: existing } = await supabase
