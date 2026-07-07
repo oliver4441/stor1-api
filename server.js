@@ -698,17 +698,15 @@ CHIPS: <chip1> | <chip2> | <chip3>
 
 Choose 2-4 chips. Default: Browse products | Track my order | Contact support`;
 
-// Free model list with fallbacks (verified working order)
-// nemotron-3-ultra-free and north-mini-code-free produce actual content reliably
-// deepseek-v4-flash-free is a reasoning model (content is empty, only reasoning_content exists)
+// Hugging Face Inference API models (OpenAI-compatible chat format via TGI)
+// Primary: Qwen2.5-72B-Instruct (excellent quality), Fallback: Phi-3.5-mini (smaller, faster)
 const NIA_MODELS = [
-  'nemotron-3-ultra-free',
-  'north-mini-code-free',
-  'deepseek-v4-flash-free',
+  'Qwen/Qwen2.5-72B-Instruct',
+  'microsoft/Phi-3.5-mini-instruct',
 ];
 
 app.post('/api/nia/chat', async (req, res) => {
-  const apiKey = process.env.OPENCODE_API_KEY;
+  const apiKey = process.env.HF_API_KEY;
 
   const { messages, userId, pageContext, cartItems } = req.body;
   if (!messages || !Array.isArray(messages)) return res.status(400).json({ error: 'Messages required' });
@@ -817,13 +815,11 @@ app.post('/api/nia/chat', async (req, res) => {
   // Try each model in order until one works
   for (const model of NIA_MODELS) {
     try {
-      const resp = await fetch('https://opencode.ai/zen/v1/chat/completions', {
+      const resp = await fetch(`https://api-inference.huggingface.co/models/${model}/v1/chat/completions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${apiKey}`,
-          'User-Agent': 'OmixStore-Nia/1.0',
-          'HTTP-Referer': 'https://omixsystems.store',
         },
         body: JSON.stringify({
           model,
