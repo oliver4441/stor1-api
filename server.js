@@ -698,11 +698,11 @@ CHIPS: <chip1> | <chip2> | <chip3>
 
 Choose 2-4 chips. Default: Browse products | Track my order | Contact support`;
 
-// Hugging Face Inference API models (OpenAI-compatible chat format via TGI)
-// Primary: Qwen2.5-72B-Instruct (excellent quality), Fallback: Phi-3.5-mini (smaller, faster)
+// Hugging Face Inference API models (OpenAI-compatible via router.huggingface.co)
+// Primary: Qwen2.5-72B-Instruct (excellent quality), Fallback: Qwen3-4B-Thinking (smaller, faster)
 const NIA_MODELS = [
   'Qwen/Qwen2.5-72B-Instruct',
-  'microsoft/Phi-3.5-mini-instruct',
+  'Qwen/Qwen3-4B-Thinking-2507',
 ];
 
 app.post('/api/nia/chat', async (req, res) => {
@@ -815,7 +815,7 @@ app.post('/api/nia/chat', async (req, res) => {
   // Try each model in order until one works
   for (const model of NIA_MODELS) {
     try {
-      const resp = await fetch(`https://api-inference.huggingface.co/models/${model}/v1/chat/completions`, {
+      const resp = await fetch('https://router.huggingface.co/v1/chat/completions', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
