@@ -2299,12 +2299,16 @@ app.post('/api/affiliates/apply', async (req, res) => {
       userId = newUser.user.id;
 
       // Create profile entry for the new user
-      await supabase.from('profiles').insert({
-        id: userId,
-        email: email,
-        full_name: full_name,
-        role: 'user',
-      }).catch(err => console.error('[Affiliate] Profile insert error:', err.message));
+      try {
+        await supabase.from('profiles').insert({
+          id: userId,
+          email: email,
+          full_name: full_name,
+          role: 'user',
+        });
+      } catch (profileErr) {
+        console.error('[Affiliate] Profile insert error:', profileErr?.message || profileErr);
+      }
     }
 
     // Check for existing application for this user
