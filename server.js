@@ -2373,6 +2373,16 @@ app.post('/api/affiliates/apply', async (req, res) => {
       details: { source: 'self-service', applied_at: new Date().toISOString() },
     });
 
+    // Send credentials email (async — don't block response)
+    if (password) {
+      email.sendAffiliateCredentials({
+        to: email,
+        name: full_name,
+        email: email,
+        loginUrl: `${process.env.FRONTEND_URL || 'https://stor1-web.onrender.com'}/login`,
+      });
+    }
+
     res.status(201).json({
       success: true,
       data: { id: affiliate.id, referral_code, status: 'pending' },
