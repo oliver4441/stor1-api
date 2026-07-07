@@ -2281,7 +2281,7 @@ app.post('/api/affiliates/apply', async (req, res) => {
       const { data: newUser, error: createError } = await supabase.auth.admin.createUser({
         email,
         password,
-        email_confirm: true,
+        email_confirm: false,
         user_metadata: { full_name },
       });
 
@@ -2292,7 +2292,7 @@ app.post('/api/affiliates/apply', async (req, res) => {
             error: 'An account with this email already exists. Please sign in and then apply.',
           });
         }
-        console.error('[Affiliate Apply] User creation error:', createError.message);
+        console.error('[Affiliate Apply] User creation error:', JSON.stringify(createError));
         return res.status(500).json({ success: false, error: 'Failed to create account. Please try again.' });
       }
 
