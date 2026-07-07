@@ -10,6 +10,7 @@ import helmet from 'helmet';
 import fetch from 'node-fetch';
 import webpush from 'web-push';
 import { createClient } from '@supabase/supabase-js';
+import { InferenceClient } from '@huggingface/inference';
 import email from './lib/email.js';
 import rateLimit from 'express-rate-limit';
 import { body, param, validationResult } from 'express-validator';
@@ -698,11 +699,11 @@ CHIPS: <chip1> | <chip2> | <chip3>
 
 Choose 2-4 chips. Default: Browse products | Track my order | Contact support`;
 
-// Hugging Face Inference API models (OpenAI-compatible via router.huggingface.co)
-// Primary: Qwen2.5-72B-Instruct (excellent quality), Fallback: Qwen3-4B-Thinking (smaller, faster)
+// Hugging Face Inference API via official SDK
+// Primary: Qwen2.5-72B-Instruct, Fallback: Qwen2.5-Coder-32B
 const NIA_MODELS = [
   'Qwen/Qwen2.5-72B-Instruct',
-  'Qwen/Qwen3-4B-Thinking-2507',
+  'Qwen/Qwen2.5-Coder-32B-Instruct',
 ];
 
 app.post('/api/nia/chat', async (req, res) => {
@@ -812,44 +813,35 @@ app.post('/api/nia/chat', async (req, res) => {
     contextPrompt += '\n\n⚠️ User is speaking Swahili. Respond in natural, conversational Swahili (Kiswahili).';
   }
 
-  // Try each model in order until one works
+  // Use official @huggingface/inference SDK
+  const hfClient = new InferenceClient(apiKey);
+
   for (const model of NIA_MODELS) {
     try {
-      const resp = await fetch('https://router.huggingface.co/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model,
-          messages: [
-            { role: 'system', content: contextPrompt },
-            ...messages,
-          ],
-          max_tokens: 600,
-          temperature: 0.7,
-        }),
+      const completion = await hfClient.chatCompletion({
+        model,
+        messages: [
+          { role: 'system', content: contextPrompt },
+          ...messages,
+        ],
+        max_tokens: 600,
+        temperature: 0.7,
       });
 
-      if (!resp.ok) {
-        console.warn(`[Nia] Model ${model} returned ${resp.status}, trying next...`);
-        continue;
-      }
+      const msg = completion?.choices?.[0]?.message || {};
+      let content = msg?.content?.trim?.();
 
-      const data = await resp.json();
-      const msg = data?.choices?.[0]?.message || {};
-      // Some models put reasoning in reasoning_content and leave content empty
-      let content = msg?.content?.trim();
+      // Handle reasoning models that put the answer in reasoning_content
       if (!content && msg?.reasoning_content) {
         content = msg.reasoning_content.trim();
       }
+
       if (!content) {
         console.warn(`[Nia] Model ${model} returned empty, trying next...`);
         continue;
       }
 
-      // Strip any markdown symbols that leaked through
+      // Strip markdown symbols for cleaner Telegram-style display
       content = content.replace(/\*/g, '').replace(/#{1,6}\s?/g, '').replace(/_{2,}/g, '').replace(/`/g, '').trim();
 
       console.log(`[Nia] Responded via ${model}`);

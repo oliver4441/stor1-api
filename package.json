@@ -8,6 +8,7 @@
     "dev": "node --watch server.js"
   },
   "dependencies": {
+    "@huggingface/inference": "^4.13.22",
     "@supabase/supabase-js": "^2.110.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
