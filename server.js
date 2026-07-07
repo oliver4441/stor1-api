@@ -2281,7 +2281,7 @@ app.post('/api/affiliates/apply', async (req, res) => {
       const { data: newUser, error: createError } = await supabase.auth.admin.createUser({
         email,
         password,
-        email_confirm: false,
+        email_confirm: true,
         user_metadata: { full_name },
       });
 
