@@ -25,6 +25,7 @@ app.use(cors({
     'https://stor1-web.onrender.com',
     'https://www.omixstore.co.ke',
     'https://omixsystems.store',
+    'https://market.omixsystems.store',
     'http://localhost:5173',
   ],
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
