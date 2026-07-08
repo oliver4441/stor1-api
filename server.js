@@ -4293,6 +4293,226 @@ app.get('/api/recommendations/trending', async (req, res) => {
   }
 });
 
+// ── Sitemap XML Endpoint ──────────────────────────────────────────────
+app.get('/api/sitemap.xml', async (req, res) => {
+  const siteUrl = process.env.SITE_URL || 'https://www.omixstore.co.ke';
+  const today = new Date().toISOString().split('T')[0];
+
+  // Static pages
+  const staticPages = [
+    { loc: '/', priority: '1.0', changefreq: 'daily' },
+    { loc: '/how-it-works', priority: '0.8', changefreq: 'monthly' },
+    { loc: '/about', priority: '0.7', changefreq: 'monthly' },
+    { loc: '/privacy', priority: '0.5', changefreq: 'monthly' },
+    { loc: '/terms', priority: '0.5', changefreq: 'monthly' },
+    { loc: '/help', priority: '0.6', changefreq: 'monthly' },
+    { loc: '/help/shopping-guide', priority: '0.6', changefreq: 'monthly' },
+    { loc: '/help/refund', priority: '0.6', changefreq: 'monthly' },
+    { loc: '/help/delivery', priority: '0.6', changefreq: 'monthly' },
+    { loc: '/help/faq', priority: '0.6', changefreq: 'monthly' },
+    { loc: '/help/payment', priority: '0.6', changefreq: 'monthly' },
+    { loc: '/wishlist', priority: '0.5', changefreq: 'weekly' },
+    { loc: '/compare', priority: '0.5', changefreq: 'weekly' },
+    { loc: '/flash-deals', priority: '0.8', changefreq: 'daily' },
+    { loc: '/wholesale', priority: '0.6', changefreq: 'weekly' },
+    { loc: '/search', priority: '0.7', changefreq: 'daily' },
+    { loc: '/affiliate', priority: '0.5', changefreq: 'monthly' },
+    { loc: '/refurbished', priority: '0.6', changefreq: 'weekly' },
+    { loc: '/install', priority: '0.4', changefreq: 'monthly' },
+  ];
+
+  try {
+    let urls = staticPages.map(p => `
+  <url>
+    <loc>${siteUrl}${p.loc}</loc>
+    <lastmod>${today}</lastmod>
+    <changefreq>${p.changefreq}</changefreq>
+    <priority>${p.priority}</priority>
+  </url>`).join('');
+
+    // Dynamic product URLs from active listings
+    if (supabase) {
+      const { data: listings, error } = await supabase
+        .from('listings')
+        .select('id, title, updated_at, category_id')
+        .eq('status', 'active');
+
+      if (!error && listings?.length) {
+        urls += listings.map(l => {
+          const lastmod = l.updated_at ? new Date(l.updated_at).toISOString().split('T')[0] : today;
+          return `
+  <url>
+    <loc>${siteUrl}/listing/${l.id}</loc>
+    <lastmod>${lastmod}</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.9</priority>
+  </url>`;
+        }).join('');
+      }
+    }
+
+    const sitemap = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls}
+</urlset>`;
+
+    res.set('Content-Type', 'application/xml');
+    res.send(sitemap);
+  } catch (err) {
+    console.error('[Sitemap] Error:', err.message);
+    res.status(500).type('text/plain').send('Failed to generate sitemap');
+  }
+});
+
+// ── AI Product Comparison Endpoint ─────────────────────────────────────
+const COMPARE_MODELS = [
+  'Qwen/Qwen2.5-72B-Instruct',
+  'microsoft/Phi-3.5-mini-instruct',
+];
+
+// Rate limit: 10 requests per minute per IP
+const compareLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many comparison requests, please try again in a moment.' }
+});
+
+app.post('/api/compare', compareLimiter, async (req, res) => {
+  const { product_ids } = req.body;
+
+  if (!product_ids || !Array.isArray(product_ids) || product_ids.length < 2 || product_ids.length > 3) {
+    return res.status(400).json({ error: 'Provide 2 or 3 product IDs in product_ids array' });
+  }
+
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+
+    const { data: products, error: prodErr } = await supabase
+      .from('listings')
+      .select('id, title, description, price, images, brand, condition, avg_rating, review_count, category_id, features, specifications')
+      .in('id', product_ids)
+      .eq('status', 'active');
+
+    if (prodErr) throw prodErr;
+    if (!products || products.length < 2) {
+      return res.status(404).json({ error: 'Could not find enough active products for comparison' });
+    }
+
+    const apiKey = process.env.HF_API_KEY;
+
+    // Build a natural language comparison prompt (~300 words)
+    const productDescriptions = products.map((p, i) => {
+      const features = p.features ? (Array.isArray(p.features) ? p.features.join(', ') : String(p.features)) : 'N/A';
+      const specs = p.specifications ? (typeof p.specifications === 'object' ? JSON.stringify(p.specifications) : String(p.specifications)) : 'N/A';
+      const rating = p.avg_rating ? `${p.avg_rating}/5 (${p.review_count || 0} reviews)` : 'No ratings yet';
+      return `Product ${i + 1}: ${p.title}
+  - Price: KES ${Number(p.price).toLocaleString()}
+  - Brand: ${p.brand || 'N/A'}
+  - Condition: ${p.condition || 'N/A'}
+  - Rating: ${rating}
+  - Description: ${(p.description || '').substring(0, 200)}
+  - Features: ${features.substring(0, 200)}
+  - Specifications: ${specs.substring(0, 200)}`;
+    }).join('\n\n');
+
+    const comparePrompt = `You are a friendly Kenyan shopping assistant helping a customer compare products on Omix Store. Write a natural, conversational "This or That" comparison of the products below. Do NOT use markdown, bullet lists, or tables. Write in plain, flowing sentences using simple Kenyan English. Keep it to about 300 words max. Highlight the key differences (price, quality, features, value) and give a clear, helpful recommendation.
+
+Products to compare:
+${productDescriptions}
+
+Write a short, warm comparison in plain text. End with a clear "Verdict:" recommending which product is better for most people and why.`;
+
+    // If no HF API key, generate a simple server-side comparison
+    if (!apiKey) {
+      const comparison = generateFallbackComparison(products);
+      return res.json({ comparison, products });
+    }
+
+    const hfClient = new InferenceClient(apiKey);
+
+    for (const model of COMPARE_MODELS) {
+      try {
+        const completion = await hfClient.chatCompletion({
+          model,
+          messages: [
+            { role: 'system', content: 'You are a friendly Kenyan shopping assistant. Respond in plain text without markdown formatting.' },
+            { role: 'user', content: comparePrompt },
+          ],
+          max_tokens: 500,
+          temperature: 0.7,
+        });
+
+        const msg = completion?.choices?.[0]?.message || {};
+        let content = msg?.content?.trim?.();
+
+        if (!content && msg?.reasoning_content) {
+          content = msg.reasoning_content.trim();
+        }
+
+        if (!content) {
+          console.warn(`[Compare] Model ${model} returned empty, trying next...`);
+          continue;
+        }
+
+        // Strip any remaining markdown symbols
+        content = content.replace(/\*/g, '').replace(/#{1,6}\s?/g, '').replace(/_{2,}/g, '').replace(/`/g, '').trim();
+
+        console.log(`[Compare] Responded via ${model}`);
+        return res.json({ comparison: content, products });
+      } catch (err) {
+        console.warn(`[Compare] Model ${model} error: ${err.message}, trying next...`);
+      }
+    }
+
+    // All AI models failed — fallback to server-side comparison
+    console.warn('[Compare] All AI models failed, using fallback comparison');
+    const comparison = generateFallbackComparison(products);
+    return res.json({ comparison, products });
+
+  } catch (err) {
+    console.error('[Compare] Error:', err.message);
+    // Last-resort fallback
+    try {
+      const comparison = generateFallbackComparison(products || []);
+      return res.json({ comparison, products: products || [] });
+    } catch {
+      return res.status(500).json({ error: 'Comparison failed', details: err.message });
+    }
+  }
+});
+
+// Server-side fallback: generates a simple spec-based comparison
+function generateFallbackComparison(products) {
+  if (!products || products.length < 2) return 'Not enough products to compare.';
+
+  const lines = [];
+  lines.push(`Let me compare the ${products.map(p => p.title).join(' vs ')} for you.\n`);
+
+  // Price comparison
+  const sortedByPrice = [...products].sort((a, b) => Number(a.price) - Number(b.price));
+  lines.push(`On price: ${sortedByPrice[0].title} is the most affordable at KES ${Number(sortedByPrice[0].price).toLocaleString()}, while ${sortedByPrice[sortedByPrice.length - 1].title} costs KES ${Number(sortedByPrice[sortedByPrice.length - 1].price).toLocaleString()}.`);
+
+  // Rating comparison
+  const ratedProducts = products.filter(p => p.avg_rating != null);
+  if (ratedProducts.length >= 2) {
+    const topRated = [...ratedProducts].sort((a, b) => (b.avg_rating || 0) - (a.avg_rating || 0))[0];
+    lines.push(`For customer satisfaction, ${topRated.title} leads with ${topRated.avg_rating}/5 from ${topRated.review_count || 0} reviews.`);
+  }
+
+  // Brand & condition
+  const brands = products.map(p => p.brand).filter(Boolean);
+  if (brands.length) lines.push(`Brands: ${[...new Set(brands)].join(', ')}.`);
+  const conditions = [...new Set(products.map(p => p.condition).filter(Boolean))];
+  if (conditions.length) lines.push(`Condition options: ${conditions.join(', ')}.`);
+
+  // Recommendation
+  const bestValue = sortedByPrice[0];
+  lines.push(`\nVerdict: If you are watching your budget, ${bestValue.title} at KES ${Number(bestValue.price).toLocaleString()} is your best bet.`);
+
+  return lines.join('\n');
+}
+
 // API-only: no SPA fallback — unmatched routes return 404 JSON
 
 app.listen(PORT, () => {
