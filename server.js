@@ -754,6 +754,15 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
      GRANT ALL ON public.return_requests TO anon, authenticated, service_role;`
   );
 
+  // M9: Seller approval flow — status column + review metadata
+  await runSql(
+    'M9: seller status + rejection_reason + reviewed_by + reviewed_at',
+    `ALTER TABLE public.sellers ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected','suspended'));
+     ALTER TABLE public.sellers ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
+     ALTER TABLE public.sellers ADD COLUMN IF NOT EXISTS reviewed_by UUID REFERENCES auth.users(id) ON DELETE SET NULL;
+     ALTER TABLE public.sellers ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;`
+  );
+
   console.log('[Migration] All startup migrations completed');
 })();
 
@@ -1025,6 +1034,62 @@ app.get('/api/products/:id/wholesale', async (req, res) => {
   }
 });
 
+// POST /api/admin/products/:id/wholesale — Save wholesale tiers (admin only)
+app.post('/api/admin/products/:id/wholesale', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { id } = req.params;
+    const { tiers } = req.body;
+
+    if (!Array.isArray(tiers)) {
+      return res.status(400).json({ success: false, error: 'tiers must be an array' });
+    }
+
+    if (tiers.length > 5) {
+      return res.status(400).json({ success: false, error: 'Maximum 5 wholesale tiers allowed' });
+    }
+
+    // Validate each tier
+    for (const tier of tiers) {
+      const minQty = parseInt(tier.min_qty);
+      const price = parseFloat(tier.price);
+      if (!minQty || minQty < 1) {
+        return res.status(400).json({ success: false, error: 'Each tier must have a valid min_qty (positive integer)' });
+      }
+      if (!price || price < 0) {
+        return res.status(400).json({ success: false, error: 'Each tier must have a valid price' });
+      }
+    }
+
+    // Delete existing tiers and insert new ones in a transaction
+    const { error: deleteError } = await supabase
+      .from('wholesale_prices')
+      .delete()
+      .eq('listing_id', id);
+
+    if (deleteError) throw deleteError;
+
+    if (tiers.length > 0) {
+      const inserts = tiers.map(tier => ({
+        listing_id: id,
+        min_quantity: parseInt(tier.min_qty),
+        price: parseFloat(tier.price),
+      }));
+
+      const { error: insertError } = await supabase
+        .from('wholesale_prices')
+        .insert(inserts);
+
+      if (insertError) throw insertError;
+    }
+
+    res.json({ success: true, message: 'Wholesale prices saved' });
+  } catch (err) {
+    console.error('[Admin Wholesale] Error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ── Seller Registration / Profile API ─────────────────────────────
 // Get seller by user_id
 app.get('/api/seller/profile', async (req, res) => {
@@ -1089,6 +1154,8 @@ app.post('/api/seller/register', async (req, res) => {
         phone: phone || null,
         email: email || null,
         address: address || null,
+        status: 'pending',
+        is_active: false,
       })
       .select('*')
       .single();
@@ -2297,6 +2364,113 @@ app.patch('/api/admin/affiliates/:id/approve', requireAdmin, async (req, res) =>
 
     res.json({ success: true, affiliate });
   } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Admin: Seller Management ─────────────────────────────────────
+
+// GET /api/admin/sellers — list all sellers with filters
+app.get('/api/admin/sellers', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+
+    const { status, search, page = 1, limit = 50 } = req.query;
+    let query = supabase
+      .from('sellers')
+      .select('*', { count: 'exact' });
+
+    // Filter by status
+    if (status && ['pending', 'approved', 'rejected', 'suspended'].includes(status)) {
+      query = query.eq('status', status);
+    }
+
+    // Search by shop name
+    if (search) {
+      query = query.ilike('shop_name', `%${search}%`);
+    }
+
+    // Order and paginate
+    query = query.order('created_at', { ascending: false });
+
+    const pageNum = Math.max(1, parseInt(page) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit) || 50));
+    const from = (pageNum - 1) * limitNum;
+    const to = from + limitNum - 1;
+    query = query.range(from, to);
+
+    const { data, error, count } = await query;
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      sellers: data || [],
+      total: count || 0,
+      page: pageNum,
+      limit: limitNum,
+      total_pages: Math.ceil((count || 0) / limitNum),
+    });
+  } catch (err) {
+    console.error('[Admin Sellers] GET error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/admin/sellers/:id/approve — approve a seller
+app.post('/api/admin/sellers/:id/approve', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { id } = req.params;
+
+    const { data, error } = await supabase
+      .from('sellers')
+      .update({
+        status: 'approved',
+        is_verified: true,
+        is_active: true,
+        reviewed_by: req.user.id,
+        reviewed_at: new Date().toISOString(),
+      })
+      .eq('id', id)
+      .select('*')
+      .single();
+
+    if (error) throw error;
+    res.json({ success: true, seller: data });
+  } catch (err) {
+    console.error('[Admin Sellers] Approve error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/admin/sellers/:id/reject — reject a seller
+app.post('/api/admin/sellers/:id/reject', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { id } = req.params;
+    const { reason } = req.body;
+
+    if (!reason || !reason.trim()) {
+      return res.status(400).json({ success: false, error: 'Rejection reason is required.' });
+    }
+
+    const { data, error } = await supabase
+      .from('sellers')
+      .update({
+        status: 'rejected',
+        is_active: false,
+        rejection_reason: reason.trim(),
+        reviewed_by: req.user.id,
+        reviewed_at: new Date().toISOString(),
+      })
+      .eq('id', id)
+      .select('*')
+      .single();
+
+    if (error) throw error;
+    res.json({ success: true, seller: data });
+  } catch (err) {
+    console.error('[Admin Sellers] Reject error:', err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
