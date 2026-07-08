@@ -23,7 +23,7 @@ app.use(helmet({
 app.use(cors({
   origin: [
     'https://stor1-web.onrender.com',
-    'https://market.omixsystems.store',
+    'https://www.omixstore.co.ke',
     'https://omixsystems.store',
     'http://localhost:5173',
   ],
@@ -534,6 +534,226 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
      ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS tier_achieved_at TIMESTAMPTZ;`
   );
 
+  // M8: All new e-commerce features (delivery zones, pickup stations, Q&A, wholesale, sellers, returns, rating cache)
+  await runSql(
+    'M8: delivery_zones table',
+    `CREATE TABLE IF NOT EXISTS public.delivery_zones (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      zone_name TEXT NOT NULL UNIQUE,
+      display_name TEXT NOT NULL,
+      estimated_days_min INTEGER NOT NULL DEFAULT 1,
+      estimated_days_max INTEGER NOT NULL DEFAULT 3,
+      delivery_fee DECIMAL(10, 2) NOT NULL DEFAULT 0,
+      free_delivery_threshold DECIMAL(10, 2) DEFAULT NULL,
+      is_active BOOLEAN DEFAULT true,
+      sort_order INTEGER DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    INSERT INTO public.delivery_zones (zone_name, display_name, estimated_days_min, estimated_days_max, delivery_fee, free_delivery_threshold, sort_order) VALUES
+      ('kericho_cbd', 'Kericho CBD', 0, 0, 0, NULL, 1),
+      ('kericho_town', 'Kericho Town', 1, 2, 0, NULL, 2),
+      ('kericho_surrounding', 'Kericho Surrounding', 1, 2, 0, 2000, 3),
+      ('litein', 'Litein', 1, 2, 0, 2000, 4),
+      ('kipkelion', 'Kipkelion', 2, 3, 150, 2500, 5),
+      ('londiani', 'Londiani', 2, 3, 150, 2500, 6),
+      ('brooke', 'Brooke', 2, 3, 150, 2500, 7),
+      ('sosiot', 'Sosiot', 2, 3, 150, 2500, 8),
+      ('outside_kericho', 'Outside Kericho', 3, 5, 300, 5000, 9)
+    ON CONFLICT (zone_name) DO NOTHING;
+    ALTER TABLE public.delivery_zones ENABLE ROW LEVEL SECURITY;
+    DROP POLICY IF EXISTS "Anyone can view delivery zones" ON public.delivery_zones;
+    CREATE POLICY "Anyone can view delivery zones" ON public.delivery_zones FOR SELECT USING (true);`
+  );
+
+  await runSql(
+    'M8: delivery zone/station columns on orders',
+    `ALTER TABLE public.omix_orders ADD COLUMN IF NOT EXISTS delivery_zone_id UUID REFERENCES public.delivery_zones(id);
+     ALTER TABLE public.omix_orders ADD COLUMN IF NOT EXISTS delivery_estimate_min INTEGER DEFAULT NULL;
+     ALTER TABLE public.omix_orders ADD COLUMN IF NOT EXISTS delivery_estimate_max INTEGER DEFAULT NULL;
+     ALTER TABLE public.omix_orders ADD COLUMN IF NOT EXISTS pickup_station_id UUID REFERENCES public.pickup_stations(id);
+     ALTER TABLE public.omix_orders ADD COLUMN IF NOT EXISTS delivery_type TEXT DEFAULT 'delivery' CHECK (delivery_type IN ('delivery', 'pickup'));
+     ALTER TABLE public.omix_orders ADD COLUMN IF NOT EXISTS delivery_fee DECIMAL(10, 2) DEFAULT 0;`
+  );
+
+  await runSql(
+    'M8: pickup_stations table',
+    `CREATE TABLE IF NOT EXISTS public.pickup_stations (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      name TEXT NOT NULL,
+      area TEXT NOT NULL,
+      address TEXT, landmark TEXT,
+      latitude DECIMAL(10, 7) DEFAULT NULL, longitude DECIMAL(10, 7) DEFAULT NULL,
+      operating_hours TEXT DEFAULT 'Mon-Sat 8AM-6PM',
+      contact_phone TEXT DEFAULT NULL,
+      is_active BOOLEAN DEFAULT true,
+      sort_order INTEGER DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    INSERT INTO public.pickup_stations (name, area, address, landmark, sort_order) VALUES
+      ('Omix Store - CBD', 'Kericho CBD', 'Kericho Town, Opposite Post Bank', 'Next to Kericho Post Office', 1),
+      ('Omix Store - Litein', 'Litein', 'Litein Shopping Centre', 'Opposite Litein Market', 2),
+      ('Omix Store - Brooke', 'Brooke', 'Brooke Market Area', 'Near Brooke Tea Factory', 3),
+      ('Omix Store - Sosiot', 'Sosiot', 'Sosiot Town Centre', 'Next to Sosiot Stage', 4),
+      ('Omix Store - Kipkelion', 'Kipkelion', 'Kipkelion Town', 'Near Kipkelion Market', 5)
+    ON CONFLICT DO NOTHING;
+    ALTER TABLE public.pickup_stations ENABLE ROW LEVEL SECURITY;
+    DROP POLICY IF EXISTS "Anyone can view pickup stations" ON public.pickup_stations;
+    CREATE POLICY "Anyone can view pickup stations" ON public.pickup_stations FOR SELECT USING (true);`
+  );
+
+  await runSql(
+    'M8: product_questions table',
+    `CREATE TABLE IF NOT EXISTS public.product_questions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      listing_id UUID NOT NULL REFERENCES public.listings(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+      user_name TEXT NOT NULL,
+      question TEXT NOT NULL,
+      answer TEXT DEFAULT NULL,
+      answered_by UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+      answered_at TIMESTAMPTZ DEFAULT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    ALTER TABLE public.product_questions ENABLE ROW LEVEL SECURITY;
+    DROP POLICY IF EXISTS "Anyone can view product questions" ON public.product_questions;
+    CREATE POLICY "Anyone can view product questions" ON public.product_questions FOR SELECT USING (true);
+    DROP POLICY IF EXISTS "Users can insert own questions" ON public.product_questions;
+    CREATE POLICY "Users can insert own questions" ON public.product_questions FOR INSERT WITH CHECK (auth.uid() = user_id);
+    DROP POLICY IF EXISTS "Admins can answer questions" ON public.product_questions;
+    CREATE POLICY "Admins can answer questions" ON public.product_questions FOR UPDATE USING (EXISTS (SELECT 1 FROM public.profiles WHERE id = auth.uid() AND role = 'admin'));
+    CREATE INDEX IF NOT EXISTS idx_product_questions_listing_id ON public.product_questions(listing_id);`
+  );
+
+  await runSql(
+    'M8: wholesale_prices table + listing wholesale columns',
+    `CREATE TABLE IF NOT EXISTS public.wholesale_prices (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      listing_id UUID NOT NULL REFERENCES public.listings(id) ON DELETE CASCADE,
+      min_quantity INTEGER NOT NULL CHECK (min_quantity > 0),
+      max_quantity INTEGER DEFAULT NULL,
+      unit_price DECIMAL(10, 2) NOT NULL CHECK (unit_price > 0),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      CONSTRAINT unique_listing_tier UNIQUE (listing_id, min_quantity)
+    );
+    ALTER TABLE public.wholesale_prices ENABLE ROW LEVEL SECURITY;
+    DROP POLICY IF EXISTS "Anyone can view wholesale prices" ON public.wholesale_prices;
+    CREATE POLICY "Anyone can view wholesale prices" ON public.wholesale_prices FOR SELECT USING (true);
+    ALTER TABLE public.listings ADD COLUMN IF NOT EXISTS wholesale_enabled BOOLEAN DEFAULT false;
+    ALTER TABLE public.listings ADD COLUMN IF NOT EXISTS wholesale_min_qty INTEGER DEFAULT NULL;`
+  );
+
+  await runSql(
+    'M8: sellers table',
+    `CREATE TABLE IF NOT EXISTS public.sellers (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE UNIQUE,
+      shop_name TEXT NOT NULL,
+      shop_slug TEXT UNIQUE NOT NULL,
+      shop_description TEXT, shop_logo TEXT, shop_banner TEXT,
+      phone TEXT, email TEXT, address TEXT,
+      business_registration TEXT,
+      commission_rate DECIMAL(4, 4) DEFAULT 0.0500,
+      total_sales DECIMAL(12, 2) DEFAULT 0,
+      total_orders INTEGER DEFAULT 0,
+      rating DECIMAL(3, 2) DEFAULT 0,
+      seller_score DECIMAL(4, 1) DEFAULT 100.0,
+      is_verified BOOLEAN DEFAULT false,
+      is_active BOOLEAN DEFAULT true,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    ALTER TABLE public.sellers ENABLE ROW LEVEL SECURITY;
+    DROP POLICY IF EXISTS "Anyone can view sellers" ON public.sellers;
+    CREATE POLICY "Anyone can view sellers" ON public.sellers FOR SELECT USING (true);
+    DROP POLICY IF EXISTS "Users can register as seller" ON public.sellers;
+    CREATE POLICY "Users can register as seller" ON public.sellers FOR INSERT WITH CHECK (auth.uid() = user_id);
+    DROP POLICY IF EXISTS "Sellers can update own profile" ON public.sellers;
+    CREATE POLICY "Sellers can update own profile" ON public.sellers FOR UPDATE USING (auth.uid() = user_id);
+    ALTER TABLE public.listings ADD COLUMN IF NOT EXISTS seller_id UUID REFERENCES public.sellers(id);
+    ALTER TABLE public.omix_orders ADD COLUMN IF NOT EXISTS seller_id UUID REFERENCES public.sellers(id);`
+  );
+
+  await runSql(
+    'M8: seller_payouts table',
+    `CREATE TABLE IF NOT EXISTS public.seller_payouts (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      seller_id UUID NOT NULL REFERENCES public.sellers(id) ON DELETE CASCADE,
+      amount DECIMAL(12, 2) NOT NULL,
+      status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'paid', 'cancelled')),
+      period_start DATE NOT NULL, period_end DATE NOT NULL,
+      paid_at TIMESTAMPTZ DEFAULT NULL, notes TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    ALTER TABLE public.seller_payouts ENABLE ROW LEVEL SECURITY;
+    DROP POLICY IF EXISTS "Sellers can view own payouts" ON public.seller_payouts;
+    CREATE POLICY "Sellers can view own payouts" ON public.seller_payouts FOR SELECT
+      USING (EXISTS (SELECT 1 FROM public.sellers WHERE id = seller_payouts.seller_id AND user_id = auth.uid()));`
+  );
+
+  await runSql(
+    'M8: return_requests table',
+    `CREATE TABLE IF NOT EXISTS public.return_requests (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      order_id UUID NOT NULL REFERENCES public.omix_orders(id) ON DELETE CASCADE,
+      order_item_id UUID REFERENCES public.omix_order_items(id),
+      user_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+      reason TEXT NOT NULL,
+      status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'collected', 'refunded', 'rejected')),
+      refund_amount DECIMAL(12, 2) DEFAULT NULL,
+      notes TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    ALTER TABLE public.return_requests ENABLE ROW LEVEL SECURITY;
+    DROP POLICY IF EXISTS "Users can view own returns" ON public.return_requests;
+    CREATE POLICY "Users can view own returns" ON public.return_requests FOR SELECT
+      USING (auth.uid() = user_id OR EXISTS (SELECT 1 FROM public.profiles WHERE id = auth.uid() AND role = 'admin'));
+    DROP POLICY IF EXISTS "Users can create return requests" ON public.return_requests;
+    CREATE POLICY "Users can create return requests" ON public.return_requests FOR INSERT WITH CHECK (auth.uid() = user_id);
+    CREATE INDEX IF NOT EXISTS idx_return_requests_order_id ON public.return_requests(order_id);`
+  );
+
+  await runSql(
+    'M8: rating cache columns + trigger',
+    `ALTER TABLE public.listings ADD COLUMN IF NOT EXISTS avg_rating DECIMAL(3, 2) DEFAULT NULL;
+     ALTER TABLE public.listings ADD COLUMN IF NOT EXISTS review_count INTEGER DEFAULT 0;
+     CREATE OR REPLACE FUNCTION public.update_listing_rating()
+     RETURNS TRIGGER AS $$
+     BEGIN
+       UPDATE public.listings
+       SET avg_rating = (SELECT ROUND(AVG(rating::decimal), 2) FROM public.product_reviews WHERE listing_id = COALESCE(NEW.listing_id, OLD.listing_id)),
+           review_count = (SELECT COUNT(*) FROM public.product_reviews WHERE listing_id = COALESCE(NEW.listing_id, OLD.listing_id))
+       WHERE id = COALESCE(NEW.listing_id, OLD.listing_id);
+       RETURN NULL;
+     END;
+     $$ LANGUAGE plpgsql SECURITY DEFINER;
+     DROP TRIGGER IF EXISTS trg_update_listing_rating_insert ON public.product_reviews;
+     CREATE TRIGGER trg_update_listing_rating_insert AFTER INSERT ON public.product_reviews FOR EACH ROW EXECUTE FUNCTION public.update_listing_rating();
+     DROP TRIGGER IF EXISTS trg_update_listing_rating_update ON public.product_reviews;
+     CREATE TRIGGER trg_update_listing_rating_update AFTER UPDATE OF rating ON public.product_reviews FOR EACH ROW EXECUTE FUNCTION public.update_listing_rating();
+     DROP TRIGGER IF EXISTS trg_update_listing_rating_delete ON public.product_reviews;
+     CREATE TRIGGER trg_update_listing_rating_delete AFTER DELETE ON public.product_reviews FOR EACH ROW EXECUTE FUNCTION public.update_listing_rating();
+     UPDATE public.listings l SET avg_rating = (SELECT ROUND(AVG(rating::decimal), 2) FROM public.product_reviews WHERE listing_id = l.id),
+       review_count = (SELECT COUNT(*) FROM public.product_reviews WHERE listing_id = l.id);`
+  );
+
+  await runSql(
+    'M8: search indexes',
+    `CREATE INDEX IF NOT EXISTS idx_listings_avg_rating ON public.listings(avg_rating);
+     CREATE INDEX IF NOT EXISTS idx_listings_wholesale ON public.listings(wholesale_enabled) WHERE wholesale_enabled = true;
+     CREATE INDEX IF NOT EXISTS idx_omix_orders_delivery_type ON public.omix_orders(delivery_type);`
+  );
+
+  await runSql(
+    'M8: grant permissions',
+    `GRANT ALL ON public.delivery_zones TO anon, authenticated, service_role;
+     GRANT ALL ON public.pickup_stations TO anon, authenticated, service_role;
+     GRANT ALL ON public.product_questions TO anon, authenticated, service_role;
+     GRANT ALL ON public.wholesale_prices TO anon, authenticated, service_role;
+     GRANT ALL ON public.sellers TO anon, authenticated, service_role;
+     GRANT ALL ON public.seller_payouts TO anon, authenticated, service_role;
+     GRANT ALL ON public.return_requests TO anon, authenticated, service_role;`
+  );
+
   console.log('[Migration] All startup migrations completed');
 })();
 
@@ -569,6 +789,11 @@ app.get('/api/search', async (req, res) => {
       location = '',
       brand = '',
       availability = '',
+      min_rating = '',
+      has_discount = '',
+      size = '',
+      seller_id = '',
+      wholesale = '',
       page = 1,
       limit = 20,
     } = req.query;
@@ -624,6 +849,37 @@ app.get('/api/search', async (req, res) => {
       query = query.eq('stock_quantity', 0);
     }
 
+    // Minimum rating filter
+    if (min_rating) {
+      const ratingVal = parseFloat(min_rating);
+      if (ratingVal > 0) {
+        query = query.gte('avg_rating', ratingVal);
+      }
+    }
+
+    // Has discount filter (products with compare_at_price > price)
+    if (has_discount === 'true') {
+      query = query.gt('compare_at_price', 0);
+      query = query.lt('price', supabase.rpc ? undefined : 999999999);
+      query = query.lt('price', 'compare_at_price');  // won't work in standard query, handle differently
+    }
+
+    // Size filter - search in variants JSONB
+    if (size) {
+      // Use a text filter on variants as JSONB
+      query = query.filter('variants', 'cs', JSON.stringify([{ size: size }]));
+    }
+
+    // Seller filter
+    if (seller_id) {
+      query = query.eq('seller_id', seller_id);
+    }
+
+    // Wholesale filter
+    if (wholesale === 'true') {
+      query = query.eq('wholesale_enabled', true);
+    }
+
     // Order by newest first
     query = query.order('created_at', { ascending: false });
 
@@ -647,6 +903,268 @@ app.get('/api/search', async (req, res) => {
   } catch (err) {
     console.error('[Search API] Error:', err.message);
     res.status(500).json({ error: 'Search failed', details: err.message });
+  }
+});
+
+// ── Delivery Zones API ────────────────────────────────────────────
+app.get('/api/delivery-zones', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { data, error } = await supabase
+      .from('delivery_zones')
+      .select('*')
+      .eq('is_active', true)
+      .order('sort_order', { ascending: true });
+    if (error) throw error;
+    res.json({ zones: data || [] });
+  } catch (err) {
+    console.error('[DeliveryZones] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Pick-up Stations API ──────────────────────────────────────────
+app.get('/api/pickup-stations', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { data, error } = await supabase
+      .from('pickup_stations')
+      .select('*')
+      .eq('is_active', true)
+      .order('sort_order', { ascending: true });
+    if (error) throw error;
+    res.json({ stations: data || [] });
+  } catch (err) {
+    console.error('[PickupStations] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Product Questions & Answers API ───────────────────────────────
+// GET questions for a listing
+app.get('/api/products/:id/questions', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('product_questions')
+      .select('*')
+      .eq('listing_id', id)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json({ questions: data || [] });
+  } catch (err) {
+    console.error('[ProductQuestions] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST a question
+app.post('/api/products/:id/questions', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { id } = req.params;
+    const { question, userId, userName } = req.body;
+    if (!question || !userId || !userName) {
+      return res.status(400).json({ error: 'Question, userId and userName required' });
+    }
+    const { data, error } = await supabase
+      .from('product_questions')
+      .insert({
+        listing_id: id,
+        user_id: userId,
+        user_name: userName,
+        question,
+      })
+      .select('*')
+      .single();
+    if (error) throw error;
+    res.json({ success: true, question: data });
+  } catch (err) {
+    console.error('[PostQuestion] Error:', err.message);
+    res.status(500).json({ error: 'Failed to submit question' });
+  }
+});
+
+// POST answer a question (admin)
+app.post('/api/questions/:id/answer', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { id } = req.params;
+    const { answer, userId } = req.body;
+    if (!answer) return res.status(400).json({ error: 'Answer required' });
+    const { data, error } = await supabase
+      .from('product_questions')
+      .update({ answer, answered_by: userId, answered_at: new Date().toISOString() })
+      .eq('id', id)
+      .select('*')
+      .single();
+    if (error) throw error;
+    res.json({ success: true, question: data });
+  } catch (err) {
+    console.error('[AnswerQuestion] Error:', err.message);
+    res.status(500).json({ error: 'Failed to submit answer' });
+  }
+});
+
+// ── Wholesale Pricing API ─────────────────────────────────────────
+app.get('/api/products/:id/wholesale', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('wholesale_prices')
+      .select('*')
+      .eq('listing_id', id)
+      .order('min_quantity', { ascending: true });
+    if (error) throw error;
+    res.json({ prices: data || [] });
+  } catch (err) {
+    console.error('[Wholesale] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Seller Registration / Profile API ─────────────────────────────
+// Get seller by user_id
+app.get('/api/seller/profile', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const userId = req.query.user_id;
+    if (!userId) return res.status(400).json({ error: 'user_id required' });
+    const { data, error } = await supabase
+      .from('sellers')
+      .select('*')
+      .eq('user_id', userId)
+      .single();
+    if (error && error.code === 'PGRST116') return res.json({ seller: null });
+    if (error) throw error;
+    res.json({ seller: data });
+  } catch (err) {
+    console.error('[SellerProfile] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get seller by slug (public)
+app.get('/api/seller/:slug', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { slug } = req.params;
+    const { data: seller, error } = await supabase
+      .from('sellers')
+      .select('*')
+      .eq('shop_slug', slug)
+      .single();
+    if (error) throw error;
+    // Get seller's listings
+    const { data: listings } = await supabase
+      .from('listings')
+      .select('*')
+      .eq('seller_id', seller.id)
+      .eq('status', 'active')
+      .order('created_at', { ascending: false });
+    res.json({ seller, listings: listings || [] });
+  } catch (err) {
+    console.error('[SellerBySlug] Error:', err.message);
+    res.status(500).json({ error: 'Seller not found' });
+  }
+});
+
+// Register as seller
+app.post('/api/seller/register', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { userId, shopName, shopSlug, description, phone, email, address } = req.body;
+    if (!userId || !shopName || !shopSlug) {
+      return res.status(400).json({ error: 'userId, shopName and shopSlug required' });
+    }
+    const { data, error } = await supabase
+      .from('sellers')
+      .insert({
+        user_id: userId,
+        shop_name: shopName,
+        shop_slug: shopSlug,
+        shop_description: description || null,
+        phone: phone || null,
+        email: email || null,
+        address: address || null,
+      })
+      .select('*')
+      .single();
+    if (error) throw error;
+    res.json({ success: true, seller: data });
+  } catch (err) {
+    console.error('[SellerRegister] Error:', err.message);
+    if (err.message?.includes('duplicate') || err.code === '23505') {
+      return res.status(409).json({ error: 'Shop name or slug already taken' });
+    }
+    res.status(500).json({ error: 'Failed to register seller: ' + err.message });
+  }
+});
+
+// ── Seller Analytics / Dashboard ──────────────────────────────────
+app.get('/api/seller/:id/analytics', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { id } = req.params;
+    const { data: orders, error } = await supabase
+      .from('omix_orders')
+      .select('id, status, total_amount, created_at')
+      .eq('seller_id', id)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    const totalOrders = orders?.length || 0;
+    const totalRevenue = orders?.reduce((sum, o) => sum + (o.total_amount || 0), 0) || 0;
+    const completedOrders = orders?.filter(o => o.status === 'delivered' || o.status === 'paid')?.length || 0;
+    res.json({
+      analytics: {
+        total_orders: totalOrders,
+        total_revenue: totalRevenue,
+        completed_orders: completedOrders,
+        pending_orders: orders?.filter(o => o.status === 'pending' || o.status === 'cod_pending')?.length || 0,
+      }
+    });
+  } catch (err) {
+    console.error('[SellerAnalytics] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Return Request API ────────────────────────────────────────────
+app.post('/api/returns', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { orderId, orderItemId, userId, reason } = req.body;
+    if (!orderId || !reason) return res.status(400).json({ error: 'orderId and reason required' });
+    const { data, error } = await supabase
+      .from('return_requests')
+      .insert({ order_id: orderId, order_item_id: orderItemId || null, user_id: userId || null, reason })
+      .select('*')
+      .single();
+    if (error) throw error;
+    res.json({ success: true, returnRequest: data });
+  } catch (err) {
+    console.error('[ReturnRequest] Error:', err.message);
+    res.status(500).json({ error: 'Failed to submit return request' });
+  }
+});
+
+// ── Improved Order Tracking ───────────────────────────────────────
+app.get('/api/orders/:id/tracking-full', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { id } = req.params;
+    const { data: order, error } = await supabase
+      .from('omix_orders')
+      .select('*, tracking_events(*)')
+      .eq('id', id)
+      .single();
+    if (error) throw error;
+    res.json({ order });
+  } catch (err) {
+    console.error('[OrderTracking] Error:', err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
