@@ -589,12 +589,14 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
       sort_order INTEGER DEFAULT 0,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
-    INSERT INTO public.pickup_stations (name, area, address, landmark, sort_order) VALUES
-      ('Omix Store - CBD', 'Kericho CBD', 'Kericho Town, Opposite Post Bank', 'Next to Kericho Post Office', 1),
-      ('Omix Store - Litein', 'Litein', 'Litein Shopping Centre', 'Opposite Litein Market', 2),
-      ('Omix Store - Brooke', 'Brooke', 'Brooke Market Area', 'Near Brooke Tea Factory', 3),
-      ('Omix Store - Sosiot', 'Sosiot', 'Sosiot Town Centre', 'Next to Sosiot Stage', 4),
-      ('Omix Store - Kipkelion', 'Kipkelion', 'Kipkelion Town', 'Near Kipkelion Market', 5)
+    INSERT INTO public.pickup_stations (name, area, address, landmark, latitude, longitude, operating_hours, contact_phone, sort_order) VALUES
+      ('Omix Store - CBD', 'Kericho CBD', 'Kericho Town, Opposite Post Bank', 'Next to Kericho Post Office', -0.3689, 35.2839, 'Mon-Sat 8AM-7PM, Sun 9AM-4PM', '254768213649', 1),
+      ('Omix Store - Litein', 'Litein', 'Litein Shopping Centre', 'Opposite Litein Market', -0.5833, 35.2000, 'Mon-Sat 8AM-6PM', '254722123456', 2),
+      ('Omix Store - Brooke', 'Brooke', 'Brooke Market Area', 'Near Brooke Tea Factory', -0.3667, 35.2833, 'Mon-Sat 8AM-6PM', '254723123456', 3),
+      ('Omix Store - Sosiot', 'Sosiot', 'Sosiot Town Centre', 'Next to Sosiot Stage', -0.4833, 35.2167, 'Mon-Sat 8AM-6PM', '254733123456', 4),
+      ('Omix Store - Kipkelion', 'Kipkelion', 'Kipkelion Town', 'Near Kipkelion Market', -0.2000, 35.4667, 'Mon-Sat 8AM-6PM', '254740123456', 5),
+      ('Omix Store - Kericho Tea Estate', 'Kericho Tea Estate', 'Tea Estate Shopping Complex, Opposite Kericho Golf Club', 'Near Kericho Golf Club', -0.3655, 35.2870, 'Mon-Sat 8AM-6:30PM, Sun 9AM-3PM', '254768213649', 6),
+      ('Omix Store - Kapkatet', 'Kapkatet', 'Kapkatet Market Area, Near Kapkatet Dispensary', 'Opposite Kapkatet Dispensary', -0.4333, 35.1500, 'Mon-Sat 8AM-5:30PM', '254755123456', 7)
     ON CONFLICT DO NOTHING;
     ALTER TABLE public.pickup_stations ENABLE ROW LEVEL SECURITY;
     DROP POLICY IF EXISTS "Anyone can view pickup stations" ON public.pickup_stations;
@@ -873,10 +875,11 @@ app.get('/api/search', async (req, res) => {
       query = query.lt('price', 'compare_at_price');  // won't work in standard query, handle differently
     }
 
-    // Size filter - search in variants JSONB
+    // Size filter - search in variants (supports both old array and new {types,items} format)
     if (size) {
-      // Use a text filter on variants as JSONB
-      query = query.filter('variants', 'cs', JSON.stringify([{ size: size }]));
+      const oldFormat = JSON.stringify([{ size }]);
+      const newFormat = JSON.stringify({ items: [{ attrs: { size } }] });
+      query = query.or(`variants.cs.${oldFormat},variants.cs.${newFormat}`);
     }
 
     // Seller filter
@@ -1652,10 +1655,16 @@ app.post('/api/paystack/webhook', express.raw({ type: 'application/json' }), asy
               .select('product_name, price, quantity, variant')
               .eq('order_id', metadata.order_id);
 
-            // Enrich items with variant info (size/color)
+            // Enrich items with variant info
             const itemsForEmail = (orderItems || []).map(item => ({
               ...item,
-              name: item.product_name + (item.variant?.size ? ` (${item.variant.size})` : '') + (item.variant?.colorName ? ` — ${item.variant.colorName}` : ''),
+              name: item.product_name + (
+                item.variant?.label
+                  ? ` (${item.variant.label})`
+                  : (item.variant?.size || item.variant?.colorName)
+                    ? ` (${item.variant.size || ''}${item.variant.size && item.variant.colorName ? ', ' : ''}${item.variant.colorName || ''})`
+                    : ''
+              ),
             }));
 
             emailLib.sendOrderConfirmation({
