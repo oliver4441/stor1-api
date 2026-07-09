@@ -538,14 +538,27 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
   // M8: All new e-commerce features (delivery zones, pickup stations, Q&A, wholesale, sellers, returns, rating cache)
 
   // Pre-M8: Deduplicate pickup_stations before adding unique constraint
+  // Must first re-link any orders referencing duplicate stations, then delete, then add constraint
   await runSql(
     'M8-pre: deduplicate pickup_stations',
-    `DELETE FROM public.pickup_stations
-     WHERE id NOT IN (
-       SELECT MIN(id)
+    `WITH keep_ids AS (
+       SELECT MIN(id) AS id, name, area
        FROM public.pickup_stations
        GROUP BY name, area
-     );`
+     ),
+     delete_ids AS (
+       SELECT p.id FROM public.pickup_stations p
+       WHERE NOT EXISTS (SELECT 1 FROM keep_ids k WHERE k.id = p.id)
+     )
+     UPDATE public.omix_orders o
+     SET pickup_station_id = k.id
+     FROM keep_ids k, delete_ids d, public.pickup_stations ps
+     WHERE o.pickup_station_id = d.id
+       AND ps.id = o.pickup_station_id
+       AND ps.name = k.name AND ps.area = k.area;
+
+     DELETE FROM public.pickup_stations p
+     WHERE EXISTS (SELECT 1 FROM delete_ids d WHERE d.id = p.id);`
   );
 
   await runSql(
