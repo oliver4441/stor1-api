@@ -536,6 +536,18 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
   );
 
   // M8: All new e-commerce features (delivery zones, pickup stations, Q&A, wholesale, sellers, returns, rating cache)
+
+  // Pre-M8: Deduplicate pickup_stations before adding unique constraint
+  await runSql(
+    'M8-pre: deduplicate pickup_stations',
+    `DELETE FROM public.pickup_stations
+     WHERE id NOT IN (
+       SELECT MIN(id)
+       FROM public.pickup_stations
+       GROUP BY name, area
+     );`
+  );
+
   await runSql(
     'M8: delivery_zones table',
     `CREATE TABLE IF NOT EXISTS public.delivery_zones (
@@ -590,6 +602,8 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
       sort_order INTEGER DEFAULT 0,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE public.pickup_stations DROP CONSTRAINT IF EXISTS pickup_stations_name_area_key;
+    ALTER TABLE public.pickup_stations ADD CONSTRAINT pickup_stations_name_area_key UNIQUE (name, area);
     INSERT INTO public.pickup_stations (name, area, address, landmark, latitude, longitude, operating_hours, contact_phone, sort_order) VALUES
       ('Omix Store - CBD', 'Kericho CBD', 'Kericho Town, Opposite Post Bank', 'Next to Kericho Post Office', -0.3689, 35.2839, 'Mon-Sat 8AM-7PM, Sun 9AM-4PM', '254768213649', 1),
       ('Omix Store - Litein', 'Litein', 'Litein Shopping Centre', 'Opposite Litein Market', -0.5833, 35.2000, 'Mon-Sat 8AM-6PM', '254722123456', 2),
@@ -598,7 +612,7 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
       ('Omix Store - Kipkelion', 'Kipkelion', 'Kipkelion Town', 'Near Kipkelion Market', -0.2000, 35.4667, 'Mon-Sat 8AM-6PM', '254740123456', 5),
       ('Omix Store - Kericho Tea Estate', 'Kericho Tea Estate', 'Tea Estate Shopping Complex, Opposite Kericho Golf Club', 'Near Kericho Golf Club', -0.3655, 35.2870, 'Mon-Sat 8AM-6:30PM, Sun 9AM-3PM', '254768213649', 6),
       ('Omix Store - Kapkatet', 'Kapkatet', 'Kapkatet Market Area, Near Kapkatet Dispensary', 'Opposite Kapkatet Dispensary', -0.4333, 35.1500, 'Mon-Sat 8AM-5:30PM', '254755123456', 7)
-    ON CONFLICT DO NOTHING;
+    ON CONFLICT (name, area) DO NOTHING;
     ALTER TABLE public.pickup_stations ENABLE ROW LEVEL SECURITY;
     DROP POLICY IF EXISTS "Anyone can view pickup stations" ON public.pickup_stations;
     CREATE POLICY "Anyone can view pickup stations" ON public.pickup_stations FOR SELECT USING (true);`
