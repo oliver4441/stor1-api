@@ -1361,6 +1361,53 @@ app.post('/api/auth/signup', async (req, res) => {
   }
 });
 
+// ── Auth: Admin Login (uses service key to set/reset password) ──
+app.post('/api/auth/admin-login', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    // 1. Look up user by email in profiles table
+    const { data: profile, error: profileError } = await supabase
+      .from('profiles')
+      .select('id, role')
+      .eq('email', email)
+      .single();
+
+    if (profileError || !profile) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // 2. Verify admin role
+    if (profile.role !== 'admin') {
+      return res.status(403).json({ error: 'Access denied. Admin privileges required.' });
+    }
+
+    // 3. Set/reset password using service key admin API
+    const { error: updateError } = await supabase.auth.admin.updateUserById(
+      profile.id,
+      { password }
+    );
+    if (updateError) throw new Error(updateError.message);
+
+    console.log(`[Admin Login] Password set for admin: ${email}`);
+
+    // 4. Return success — frontend will now sign in with these credentials
+    res.json({
+      success: true,
+      user: { id: profile.id, email },
+      message: 'Admin credentials accepted. Try signing in now.'
+    });
+  } catch (err) {
+    console.error('[Admin Login] Error:', err.message);
+    res.status(500).json({ error: err.message || 'Admin login failed' });
+  }
+});
+
 // ── Nia AI Chat Proxy ──────────────────────────────────────────────
 const NIA_SYSTEM_PROMPT = `You are Nia, the friendly AI assistant for Omix Store — an online marketplace based in Kericho, Kenya. You talk like a real Kenyan, simple and warm.
 
