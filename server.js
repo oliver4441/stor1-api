@@ -1266,6 +1266,101 @@ app.get('/api/orders/:id/tracking-full', async (req, res) => {
   }
 });
 
+// ── Auth: Signup (server-side, uses service key) ────────────────
+app.post('/api/auth/signup', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+
+    const { email, password, fullName, refCode } = req.body;
+    if (!email || !password || !fullName) {
+      return res.status(400).json({ error: 'Email, password, and full name are required' });
+    }
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
+    // 1. Create auth user with email auto-confirmed (uses service key)
+    const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+      email,
+      password,
+      email_confirm: true,
+      user_metadata: { full_name: fullName },
+    });
+    if (authError) throw new Error(authError.message);
+
+    const userId = authData.user.id;
+
+    // 2. Create profile
+    const genRefCode = userId.replace(/-/g, '').slice(0, 8).toUpperCase();
+    const { error: profileError } = await supabase.from('profiles').upsert({
+      id: userId,
+      full_name: fullName,
+      email,
+      role: 'customer',
+      loyalty_points: 0,
+      referral_code: genRefCode,
+    }, { onConflict: 'id' });
+    if (profileError) throw new Error('Failed to create profile: ' + profileError.message);
+
+    // 3. Process referral if provided
+    if (refCode) {
+      try {
+        // Look up affiliate by referral code
+        const { data: affiliate } = await supabase
+          .from('affiliates')
+          .select('id, user_id, tier')
+          .eq('referral_code', refCode)
+          .eq('status', 'active')
+          .single();
+
+        if (affiliate) {
+          // Check if user already has a referral attribution
+          const { data: existing } = await supabase
+            .from('referrals')
+            .select('id')
+            .eq('referred_user_id', userId)
+            .single();
+
+          if (!existing) {
+            await supabase.from('referrals').insert({
+              affiliate_id: affiliate.id,
+              affiliate_user_id: affiliate.user_id,
+              referred_user_id: userId,
+              referred_email: email,
+              status: 'pending',
+              commission_rate: affiliate.tier === 'gold' ? 10.0 : 5.0,
+              referral_code: refCode,
+            });
+          }
+        }
+      } catch (refErr) {
+        console.warn('[Signup] Referral processing skipped:', refErr.message);
+      }
+    }
+
+    // 4. Sign the user in (generate session token)
+    const { data: sessionData, error: sessionError } = await supabase.auth.admin.generateLink({
+      type: 'magiclink',
+      email,
+    });
+    // If session generation succeeds, we return success
+    // The frontend will sign in with the credentials directly
+
+    console.log(`[Signup] New user created: ${email} (${userId})`);
+    res.json({
+      success: true,
+      user: { id: userId, email },
+    });
+  } catch (err) {
+    console.error('[Signup] Error:', err.message);
+    // Handle duplicate email
+    if (err.message?.includes('already registered') || err.message?.includes('already exists')) {
+      return res.status(409).json({ error: 'An account with this email already exists' });
+    }
+    res.status(500).json({ error: err.message || 'Signup failed' });
+  }
+});
+
 // ── Nia AI Chat Proxy ──────────────────────────────────────────────
 const NIA_SYSTEM_PROMPT = `You are Nia, the friendly AI assistant for Omix Store — an online marketplace based in Kericho, Kenya. You talk like a real Kenyan, simple and warm.
 
@@ -1429,50 +1524,12 @@ app.post('/api/nia/chat', async (req, res) => {
     contextPrompt += '\n\n⚠️ User is speaking Swahili. Respond in natural, conversational Swahili (Kiswahili).';
   }
 
-  // Use official @huggingface/inference SDK
+  // Use @huggingface/inference SDK for fallback
   const hfClient = new InferenceClient(apiKey);
 
   let lastError = null;
 
-  // Try Hugging Face models
-  for (const model of NIA_MODELS) {
-    try {
-      const completion = await hfClient.chatCompletion({
-        model,
-        messages: [
-          { role: 'system', content: contextPrompt },
-          ...messages,
-        ],
-        max_tokens: 600,
-        temperature: 0.7,
-      });
-
-      const msg = completion?.choices?.[0]?.message || {};
-      let content = msg?.content?.trim?.();
-
-      // Handle reasoning models that put the answer in reasoning_content
-      if (!content && msg?.reasoning_content) {
-        content = msg.reasoning_content.trim();
-      }
-
-      if (!content) {
-        console.warn(`[Nia] Model ${model} returned empty, trying next...`);
-        continue;
-      }
-
-      // Strip markdown symbols for cleaner Telegram-style display
-      content = content.replace(/\*/g, '').replace(/#{1,6}\s?/g, '').replace(/_{2,}/g, '').replace(/`/g, '').trim();
-
-      console.log(`[Nia] Responded via ${model}`);
-      res.json({ content });
-      return;
-    } catch (err) {
-      lastError = err;
-      console.warn(`[Nia] Model ${model} error: ${err.message}, trying next...`);
-    }
-  }
-
-  // Try OpenCode/Zen API as fallback
+  // Try OpenCode/Zen API first (primary provider)
   const opencodeKey = process.env.OPENCODE_API_KEY;
   if (opencodeKey) {
     try {
@@ -1516,6 +1573,44 @@ app.post('/api/nia/chat', async (req, res) => {
     } catch (ocErr) {
       lastError = ocErr;
       console.warn(`[Nia] OpenCode/Zen error: ${ocErr.message}`);
+    }
+  }
+
+  // Try Hugging Face models as fallback
+  for (const model of NIA_MODELS) {
+    try {
+      const completion = await hfClient.chatCompletion({
+        model,
+        messages: [
+          { role: 'system', content: contextPrompt },
+          ...messages,
+        ],
+        max_tokens: 600,
+        temperature: 0.7,
+      });
+
+      const msg = completion?.choices?.[0]?.message || {};
+      let content = msg?.content?.trim?.();
+
+      // Handle reasoning models that put the answer in reasoning_content
+      if (!content && msg?.reasoning_content) {
+        content = msg.reasoning_content.trim();
+      }
+
+      if (!content) {
+        console.warn(`[Nia] Model ${model} returned empty, trying next...`);
+        continue;
+      }
+
+      // Strip markdown symbols for cleaner Telegram-style display
+      content = content.replace(/\*/g, '').replace(/#{1,6}\s?/g, '').replace(/_{2,}/g, '').replace(/`/g, '').trim();
+
+      console.log(`[Nia] Responded via ${model}`);
+      res.json({ content });
+      return;
+    } catch (err) {
+      lastError = err;
+      console.warn(`[Nia] Model ${model} error: ${err.message}, trying next...`);
     }
   }
 
