@@ -1432,6 +1432,9 @@ app.post('/api/nia/chat', async (req, res) => {
   // Use official @huggingface/inference SDK
   const hfClient = new InferenceClient(apiKey);
 
+  let lastError = null;
+
+  // Try Hugging Face models
   for (const model of NIA_MODELS) {
     try {
       const completion = await hfClient.chatCompletion({
@@ -1464,12 +1467,60 @@ app.post('/api/nia/chat', async (req, res) => {
       res.json({ content });
       return;
     } catch (err) {
+      lastError = err;
       console.warn(`[Nia] Model ${model} error: ${err.message}, trying next...`);
     }
   }
 
+  // Try OpenCode/Zen API as fallback
+  const opencodeKey = process.env.OPENCODE_API_KEY;
+  if (opencodeKey) {
+    try {
+      const opencodeRes = await fetch('https://opencode.ai/zen/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${opencodeKey}`,
+        },
+        body: JSON.stringify({
+          model: 'deepseek-v4-flash-free',
+          messages: [
+            { role: 'system', content: contextPrompt },
+            ...messages,
+          ],
+          max_tokens: 600,
+          temperature: 0.7,
+        }),
+      });
+
+      if (opencodeRes.ok) {
+        const opencodeData = await opencodeRes.json();
+        const choice = opencodeData?.choices?.[0] || {};
+        let content = choice?.message?.content?.trim?.();
+
+        // Handle reasoning models (content in reasoning_content instead)
+        if (!content && choice?.message?.reasoning_content) {
+          content = choice.message.reasoning_content.trim();
+        }
+
+        if (content) {
+          content = content.replace(/\*/g, '').replace(/#{1,6}\s?/g, '').replace(/_{2,}/g, '').replace(/`/g, '').trim();
+          console.log('[Nia] Responded via opencode/zen (deepseek-v4-flash-free)');
+          res.json({ content });
+          return;
+        }
+      } else {
+        const errText = await opencodeRes.text();
+        console.warn(`[Nia] OpenCode/Zen error: HTTP ${opencodeRes.status} - ${errText}`);
+      }
+    } catch (ocErr) {
+      lastError = ocErr;
+      console.warn(`[Nia] OpenCode/Zen error: ${ocErr.message}`);
+    }
+  }
+
   // All models failed
-  res.status(502).json({ error: 'All AI models unavailable. Please try again.' });
+  res.status(502).json({ error: `All AI models unavailable. ${lastError?.message || ''}` });
 });
 
 // ── Initialize Paystack Inline Payment ─────────────────────────────────────────
@@ -3977,7 +4028,25 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
 
     if (error) throw error;
 
-    res.json({ success: true, data: data || [] });
+    // Enrich with participant info
+    const enriched = await Promise.all((data || []).map(async (conv) => {
+      const { data: participants } = await supabase
+        .from('conversation_participants')
+        .select('user_id, profiles:user_id(full_name, avatar_url, email)')
+        .eq('conversation_id', conv.id);
+
+      return {
+        ...conv,
+        participants: (participants || []).map(p => ({
+          user_id: p.user_id,
+          full_name: p.profiles?.full_name || null,
+          avatar_url: p.profiles?.avatar_url || null,
+          email: p.profiles?.email || null,
+        })),
+      };
+    }));
+
+    res.json({ success: true, data: enriched });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
