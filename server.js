@@ -828,6 +828,16 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
      CREATE INDEX IF NOT EXISTS idx_omix_order_items_seller_id ON public.omix_order_items(seller_id);`
   );
 
+  // M11: Missing columns for search filters (safe IF NOT EXISTS, independent of M8 trigger batch)
+  await runSql(
+    'M11: ensure search filter columns exist',
+    `ALTER TABLE public.listings ADD COLUMN IF NOT EXISTS avg_rating DECIMAL(3, 2) DEFAULT NULL;
+     ALTER TABLE public.listings ADD COLUMN IF NOT EXISTS review_count INTEGER DEFAULT 0;
+     ALTER TABLE public.listings ADD COLUMN IF NOT EXISTS compare_at_price DECIMAL(12, 2) DEFAULT NULL;
+     CREATE INDEX IF NOT EXISTS idx_listings_avg_rating ON public.listings(avg_rating);
+     CREATE INDEX IF NOT EXISTS idx_listings_compare_at_price ON public.listings(compare_at_price) WHERE compare_at_price IS NOT NULL;`
+  );
+
   console.log('[Migration] All startup migrations completed');
 })();
 
@@ -874,8 +884,11 @@ app.get('/api/search', async (req, res) => {
     } = req.query;
 
     // ── Try Meilisearch first for text-search queries ──
-    // Only use Meilisearch when there's a search query or filters it can handle
-    const useMeili = meiliSearch.isAvailable() && (q || category || brand || min_price || max_price);
+    // Only use Meilisearch when ALL active filters can be handled by it.
+    // If extra filters (condition, location, availability, min_rating, has_discount, size) are active,
+    // skip Meilisearch and go straight to DB to avoid silently ignoring those filters.
+    const extraFilters = condition || location || availability || min_rating || has_discount || size || seller_id || wholesale;
+    const useMeili = meiliSearch.isAvailable() && !extraFilters && (q || category || brand || min_price || max_price);
     if (useMeili) {
       try {
         const meiliResult = await meiliSearch.searchProducts({
@@ -952,9 +965,9 @@ app.get('/api/search', async (req, res) => {
       }
     }
 
-    // Location
+    // Location — search both city and region columns (table has location_city + location_region, not 'location')
     if (location) {
-      query = query.ilike('location', `%${location}%`);
+      query = query.or(`location_city.ilike.%${location}%,location_region.ilike.%${location}%`);
     }
 
     // Brand
@@ -969,7 +982,7 @@ app.get('/api/search', async (req, res) => {
       query = query.eq('stock_quantity', 0);
     }
 
-    // Minimum rating filter
+    // Minimum rating filter (requires avg_rating column added by M8 migration)
     if (min_rating) {
       const ratingVal = parseFloat(min_rating);
       if (ratingVal > 0) {
@@ -978,6 +991,7 @@ app.get('/api/search', async (req, res) => {
     }
 
     // Has discount filter (products with compare_at_price set and active sale)
+    // Requires compare_at_price column added by M11 migration
     if (has_discount === 'true') {
       query = query.gt('compare_at_price', 0);
     }
