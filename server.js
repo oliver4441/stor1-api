@@ -2006,8 +2006,10 @@ app.post('/api/email/welcome', requireApiKey, async (req, res) => {
     const { to, name } = req.body;
     if (!to) return res.status(400).json({ message: 'Email address required', debug });
 
+    console.log('[Welcome] Calling sendWelcomeEmail with', { to, name });
     const result = await emailLib.sendWelcomeEmail({ to, name });
-    res.json({ success: result.sent, message: result.sent ? 'Welcome email sent' : 'Welcome email skipped (no API key)' });
+    console.log('[Welcome] Result:', JSON.stringify(result));
+    res.json({ success: result.sent, message: result.sent ? 'Welcome email sent' : 'Welcome email skipped (no API key)', result });
   } catch (err) {
     res.status(500).json({ message: 'Failed to send welcome email', error: err.message });
   }
