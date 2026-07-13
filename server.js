@@ -14,6 +14,7 @@ import { InferenceClient } from '@huggingface/inference';
 import emailLib from './lib/email.js';
 import rateLimit from 'express-rate-limit';
 import { body, param, validationResult } from 'express-validator';
+import * as meiliSearch from './lib/meilisearch.js';
 
 const app = express();
 app.use(helmet({
@@ -856,8 +857,8 @@ app.get('/api/search', async (req, res) => {
     const {
       q = '',
       category = '',
-      min_price = 0,
-      max_price = 999999,
+      min_price = '',
+      max_price = '',
       condition = '',
       location = '',
       brand = '',
@@ -867,10 +868,35 @@ app.get('/api/search', async (req, res) => {
       size = '',
       seller_id = '',
       wholesale = '',
+      sort = '',
       page = 1,
       limit = 20,
     } = req.query;
 
+    // ── Try Meilisearch first for text-search queries ──
+    // Only use Meilisearch when there's a search query or filters it can handle
+    const useMeili = meiliSearch.isAvailable() && (q || category || brand || min_price || max_price);
+    if (useMeili) {
+      try {
+        const meiliResult = await meiliSearch.searchProducts({
+          q,
+          category,
+          brand,
+          min_price,
+          max_price,
+          sort,
+          page,
+          limit,
+        });
+        if (meiliResult) {
+          return res.json(meiliResult);
+        }
+      } catch (meiliErr) {
+        console.error('[Search] Meilisearch failed, falling back to DB:', meiliErr.message);
+      }
+    }
+
+    // ── Fallback: Database search ──
     let query = supabase
       .from('listings')
       .select('*', { count: 'exact' })
@@ -884,9 +910,30 @@ app.get('/api/search', async (req, res) => {
       }
     }
 
-    // Category filter
+    // Category filter — map category name to integer category_id
     if (category) {
-      query = query.eq('category', category);
+      const CATEGORY_TO_ID = {
+        'Electronics': 1,
+        'Furniture': 2,
+        'Clothing': 3,
+        'Books': 4,
+        'Vehicles': 5,
+        'Home & Garden': 6,
+        'Sports': 7,
+        'Toys & Games': 8,
+        'Health & Beauty': 9,
+        'Services': 10,
+        'Business Services': 10,
+        'Food': 12,
+        'Drinks': 13,
+        'Snacks': 14,
+        'Bakery': 15,
+        'Others': 11,
+      };
+      const catId = CATEGORY_TO_ID[category] || null;
+      if (catId) {
+        query = query.eq('category_id', catId);
+      }
     }
 
     // Price range
@@ -930,11 +977,9 @@ app.get('/api/search', async (req, res) => {
       }
     }
 
-    // Has discount filter (products with compare_at_price > price)
+    // Has discount filter (products with compare_at_price set and active sale)
     if (has_discount === 'true') {
       query = query.gt('compare_at_price', 0);
-      query = query.lt('price', supabase.rpc ? undefined : 999999999);
-      query = query.lt('price', 'compare_at_price');  // won't work in standard query, handle differently
     }
 
     // Size filter - search in variants (supports both old array and new {types,items} format)
@@ -954,7 +999,23 @@ app.get('/api/search', async (req, res) => {
       query = query.eq('wholesale_enabled', true);
     }
 
-    // Order by newest first
+    // Sort parameter
+    switch (sort) {
+      case 'price_asc':
+        query = query.order('price', { ascending: true });
+        break;
+      case 'price_desc':
+        query = query.order('price', { ascending: false });
+        break;
+      case 'rating_desc':
+        query = query.order('avg_rating', { ascending: false, nullsFirst: false });
+        break;
+      case 'newest':
+      default:
+        query = query.order('created_at', { ascending: false });
+        break;
+    }
+    // Tiebreaker: always order by newest as fallback
     query = query.order('created_at', { ascending: false });
 
     // Pagination
@@ -977,6 +1038,37 @@ app.get('/api/search', async (req, res) => {
   } catch (err) {
     console.error('[Search API] Error:', err.message);
     res.status(500).json({ error: 'Search failed', details: err.message });
+  }
+});
+
+// ── Meilisearch Sync Endpoints ─────────────────────────────────────
+// POST /api/search/sync — index or update a product document
+app.post('/api/search/sync', async (req, res) => {
+  try {
+    const { product } = req.body;
+    if (!product || !product.id) {
+      return res.status(400).json({ success: false, error: 'Product object with id is required' });
+    }
+    const ok = await meiliSearch.indexProduct(product);
+    res.json({ success: ok });
+  } catch (err) {
+    console.error('[Search Sync] Error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// DELETE /api/search/sync/:id — remove a product document
+app.delete('/api/search/sync/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id) {
+      return res.status(400).json({ success: false, error: 'Product id is required' });
+    }
+    const ok = await meiliSearch.removeProduct(id);
+    res.json({ success: ok });
+  } catch (err) {
+    console.error('[Search Sync Delete] Error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
