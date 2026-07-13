@@ -1994,6 +1994,17 @@ const requireApiKey = (req, res, next) => {
 
 // ── Public API endpoints for email services ─────────────────────────────────────
 
+// Debug: check email module state
+app.get('/api/debug/resend', (req, res) => {
+  res.json({
+    process_env: {
+      RESEND_API_KEY: process.env.RESEND_API_KEY ? 'SET (len=' + process.env.RESEND_API_KEY.length + ', chars=' + process.env.RESEND_API_KEY.charAt(0) + '...' + process.env.RESEND_API_KEY.slice(-4) + ')' : 'NOT SET',
+      RESEND_FROM: process.env.RESEND_FROM || 'NOT SET',
+    },
+    // We import the module fresh test below
+  });
+});
+
 // Send welcome email after user signup
 app.post('/api/email/welcome', requireApiKey, async (req, res) => {
   try {
