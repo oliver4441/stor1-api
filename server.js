@@ -1997,8 +1997,14 @@ const requireApiKey = (req, res, next) => {
 // Send welcome email after user signup
 app.post('/api/email/welcome', requireApiKey, async (req, res) => {
   try {
+    // Debug: check env vars
+    const debug = {
+      RESEND_API_KEY: process.env.RESEND_API_KEY ? 'SET (len=' + process.env.RESEND_API_KEY.length + ')' : 'NOT SET',
+      RESEND_FROM: process.env.RESEND_FROM || 'NOT SET',
+      NODE_ENV: process.env.NODE_ENV || 'NOT SET',
+    };
     const { to, name } = req.body;
-    if (!to) return res.status(400).json({ message: 'Email address required' });
+    if (!to) return res.status(400).json({ message: 'Email address required', debug });
 
     const result = await emailLib.sendWelcomeEmail({ to, name });
     res.json({ success: result.sent, message: result.sent ? 'Welcome email sent' : 'Welcome email skipped (no API key)' });
