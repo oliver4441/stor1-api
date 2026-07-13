@@ -15,29 +15,41 @@ const MEILI_HOST = process.env.MEILI_HOST || '';
 const MEILI_MASTER_KEY = process.env.MEILI_MASTER_KEY || '';
 const MEILI_INDEX = process.env.MEILI_INDEX || 'products';
 
-// ── Category ID → Name mapping ──
 const ID_TO_CATEGORY = {
-  1: 'Electronics',
-  2: 'Furniture',
-  3: 'Clothing',
-  4: 'Books',
-  5: 'Vehicles',
-  6: 'Home & Garden',
-  7: 'Sports',
-  8: 'Toys & Games',
-  9: 'Health & Beauty',
-  10: 'Services',
-  11: 'Others',
-  12: 'Food',
-  13: 'Drinks',
-  14: 'Snacks',
-  15: 'Bakery',
+  1: 'Electronics', 2: 'Furniture', 3: 'Clothing', 4: 'Books',
+  5: 'Vehicles', 6: 'Home & Garden', 7: 'Sports', 8: 'Toys & Games',
+  9: 'Health & Beauty', 10: 'Services', 11: 'Others',
+  12: 'Food', 13: 'Drinks', 14: 'Snacks', 15: 'Bakery',
 };
 
-async function main() {
-  console.log('=== Omix Store — Product Indexer ===\n');
+function buildDoc(p) {
+  return {
+    id: String(p.id),
+    name: p.title || p.name || '',
+    description: p.description || '',
+    category: ID_TO_CATEGORY[p.category_id] || p.category || 'Others',
+    brand: p.brand || '',
+    price: parseFloat(p.price) || 0,
+    stock: parseInt(p.stock_quantity ?? p.quantity ?? 0) || 0,
+    images: Array.isArray(p.images) ? p.images : [],
+    rating: parseFloat(p.avg_rating ?? p.rating ?? 0) || 0,
+    createdAt: p.created_at || new Date().toISOString(),
+  };
+}
 
-  // Validate env
+// Fields that determine whether a re-index is needed
+const COMPARE_KEYS = ['name', 'description', 'category', 'brand', 'price', 'stock', 'rating'];
+
+function compareChanged(dbDoc, meiliDoc) {
+  for (const key of COMPARE_KEYS) {
+    if (String(dbDoc[key] ?? '') !== String(meiliDoc[key] ?? '')) return true;
+  }
+  return false;
+}
+
+async function main() {
+  console.log('=== Omix Store - Product Indexer ===\n');
+
   if (!MEILI_HOST || !MEILI_MASTER_KEY) {
     console.error('ERROR: MEILI_HOST and MEILI_MASTER_KEY env vars must be set');
     process.exit(1);
@@ -47,158 +59,112 @@ async function main() {
     process.exit(1);
   }
 
-  // ── Init clients ──
-  const supabase = createClient(
-    process.env.SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_KEY
-  );
+  const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+  const meili = new Meilisearch({ host: MEILI_HOST, apiKey: MEILI_MASTER_KEY });
 
-  const meili = new Meilisearch({
-    host: MEILI_HOST,
-    apiKey: MEILI_MASTER_KEY,
-  });
-
-  // ── Ensure index exists with proper config ──
-  console.log('Ensuring Meilisearch index exists...');
+  // ── Ensure index ──
+  console.log('Ensuring index...');
   const indexes = await meili.getIndexes();
-  const exists = indexes.results?.some(i => i.uid === MEILI_INDEX);
-  if (!exists) {
+  if (!indexes.results?.some(i => i.uid === MEILI_INDEX)) {
     await meili.createIndex(MEILI_INDEX, { primaryKey: 'id' });
-    console.log('  Created index:', MEILI_INDEX);
+    console.log('  Created:', MEILI_INDEX);
   } else {
-    console.log('  Index already exists:', MEILI_INDEX);
+    console.log('  Exists:', MEILI_INDEX);
   }
-
   const idx = meili.index(MEILI_INDEX);
-
-  // Configure search/filter/sort attributes
   await idx.updateSearchableAttributes(['name', 'description', 'category', 'brand']);
   await idx.updateFilterableAttributes(['category', 'brand', 'price', 'rating', 'createdAt']);
   await idx.updateSortableAttributes(['price', 'createdAt', 'rating']);
-  console.log('  Index settings configured.\n');
+  console.log('  Settings configured.\n');
 
-  // ── Get current indexed IDs ──
-  let existingDocIds = new Set();
+  // ── Fetch existing Meilisearch docs (all content fields) ──
+  const existingDocs = new Map();
   try {
-    const allDocs = [];
     let offset = 0;
-    const batchSize = 1000;
     while (true) {
-      const result = await idx.getDocuments({ offset, limit: batchSize, fields: ['id'] });
+      const result = await idx.getDocuments({ offset, limit: 1000, fields: ['id', ...COMPARE_KEYS] });
       const docs = result.results || [];
       if (docs.length === 0) break;
-      allDocs.push(...docs);
-      offset += batchSize;
+      for (const d of docs) existingDocs.set(String(d.id), d);
+      offset += docs.length;
     }
-    existingDocIds = new Set(allDocs.map(d => String(d.id)));
-    console.log(`Already indexed documents: ${existingDocIds.size}`);
+    console.log(`Existing indexed docs: ${existingDocs.size}`);
   } catch (err) {
-    console.log('Could not fetch existing documents (fresh index or error):', err.message);
+    console.log('Fetching existing docs failed (fresh index?):', err.message);
   }
 
   // ── Fetch all active products from DB ──
-  console.log('\nFetching products from database...');
-  const { data: products, error, count } = await supabase
+  console.log('\nFetching active products from DB...');
+  const { data: products, error } = await supabase
     .from('listings')
     .select('*', { count: 'exact' })
     .eq('status', 'active');
 
-  if (error) {
-    console.error('ERROR fetching products:', error.message);
-    process.exit(1);
-  }
+  if (error) { console.error('ERROR:', error.message); process.exit(1); }
 
-  console.log(`Products found in DB: ${count || products.length}`);
+  const totalFound = products?.length || 0;
+  console.log(`Products found in DB: ${totalFound}`);
+  if (!totalFound) { console.log('No products. Done.'); return; }
 
-  if (!products || products.length === 0) {
-    console.log('No products to index. Done.');
-    return;
-  }
-
-  // ── Build documents ──
-  function buildDoc(p) {
-    const catName = ID_TO_CATEGORY[p.category_id] || p.category || 'Others';
-    return {
-      id: String(p.id),
-      name: p.title || p.name || '',
-      description: p.description || '',
-      category: catName,
-      brand: p.brand || '',
-      price: parseFloat(p.price) || 0,
-      stock: parseInt(p.stock_quantity ?? p.quantity ?? 0) || 0,
-      images: Array.isArray(p.images) ? p.images : [],
-      rating: parseFloat(p.avg_rating ?? p.rating ?? 0) || 0,
-      createdAt: p.created_at || new Date().toISOString(),
-    };
-  }
-
-  const docs = products.map(buildDoc);
-
-  // Separate new vs skip
+  // ── Diff: skip unchanged, index new/changed ──
   const toIndex = [];
   let skipped = 0;
-  for (const doc of docs) {
-    if (existingDocIds.has(doc.id)) {
-      skipped++;
+  let updated = 0;
+
+  for (const product of products) {
+    const doc = buildDoc(product);
+    const existing = existingDocs.get(doc.id);
+    if (existing) {
+      if (compareChanged(doc, existing)) {
+        toIndex.push(doc);
+        updated++;
+      } else {
+        skipped++;
+      }
     } else {
       toIndex.push(doc);
     }
   }
 
-  console.log(`\nTo index (new/updated): ${toIndex.length}`);
-  console.log(`Skipped (already indexed): ${skipped}`);
+  console.log(`  New:         ${toIndex.length - updated}`);
+  console.log(`  Updated:     ${updated}`);
+  console.log(`  Skipped:     ${skipped}\n`);
 
-  // ── Index in batches ──
+  // ── Index ──
+  let indexed = 0;
+  let failures = 0;
+
   if (toIndex.length > 0) {
-    const BATCH_SIZE = 100;
-    let indexed = 0;
-    let failures = 0;
-
-    console.log(`\nIndexing in batches of ${BATCH_SIZE}...`);
-
-    for (let i = 0; i < toIndex.length; i += BATCH_SIZE) {
-      const batch = toIndex.slice(i, i + BATCH_SIZE);
+    const BATCH = 100;
+    console.log(`Indexing ${toIndex.length} products...`);
+    for (let i = 0; i < toIndex.length; i += BATCH) {
+      const batch = toIndex.slice(i, i + BATCH);
       try {
-        const result = await idx.addDocuments(batch);
+        await idx.addDocuments(batch);
         indexed += batch.length;
-        const pct = Math.min(100, Math.round(((i + batch.length) / toIndex.length) * 100));
-        process.stdout.write(`\r  Progress: ${indexed}/${toIndex.length} (${pct}%)`);
+        const pct = Math.min(100, Math.round((indexed / toIndex.length) * 100));
+        process.stdout.write(`\r  ${indexed}/${toIndex.length} (${pct}%)`);
       } catch (err) {
         failures += batch.length;
-        console.error(`\n  Batch ${Math.floor(i / BATCH_SIZE) + 1} failed:`, err.message);
+        console.error(`\n  Batch ${Math.floor(i / BATCH) + 1} failed:`, err.message);
       }
     }
-    console.log('\n');
-
-    // ── Report ──
-    console.log('=== Indexing Report ===');
-    console.log(`  Products found in DB:    ${products.length}`);
-    console.log(`  Successfully indexed:    ${indexed}`);
-    console.log(`  Skipped (already had):   ${skipped}`);
-    console.log(`  Failures:                ${failures}`);
-
-    if (failures > 0) {
-      console.log('\nWARNING: Some products failed to index. Check errors above.');
-    }
-  } else {
-    console.log('\nNo new products to index. All products are already indexed.');
-    console.log(`=== Indexing Report ===`);
-    console.log(`  Products found in DB:    ${products.length}`);
-    console.log(`  Successfully indexed:    0`);
-    console.log(`  Skipped (already had):   ${products.length}`);
-    console.log(`  Failures:                0`);
+    console.log();
   }
 
-  // Final count
+  // ── Report ──
+  console.log('\n=== Indexing Report ===');
+  console.log(`  Products found in DB:    ${totalFound}`);
+  console.log(`  Successfully indexed:    ${indexed}`);
+  console.log(`  Skipped (unchanged):     ${skipped}`);
+  console.log(`  Failures:                ${failures}`);
+
   try {
     const stats = await idx.getStats();
-    console.log(`\nMeilisearch total documents: ${stats.numberOfDocuments}`);
-  } catch { /* ignore */ }
+    console.log(`  Meilisearch doc count:   ${stats.numberOfDocuments}`);
+  } catch { /* skip */ }
 
   console.log('\nDone.');
 }
 
-main().catch(err => {
-  console.error('Fatal error:', err);
-  process.exit(1);
-});
+main().catch(err => { console.error('Fatal:', err); process.exit(1); });
