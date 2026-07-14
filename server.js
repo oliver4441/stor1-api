@@ -1287,12 +1287,22 @@ app.get('/api/seller/:slug', async (req, res) => {
   try {
     if (!supabase) return res.status(503).json({ error: 'Database not available' });
     const { slug } = req.params;
+    // Avoid colliding with POST /api/seller/register — this GET is for public seller pages by slug
+    if (slug === 'register' || slug === 'profile') {
+      return res.status(404).json({ error: 'Seller not found' });
+    }
     const { data: seller, error } = await supabase
       .from('sellers')
       .select('*')
       .eq('shop_slug', slug)
       .single();
-    if (error) throw error;
+    if (error) {
+      // PostgREST returns PGRST116 when single() finds no rows
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: 'Seller not found' });
+      }
+      throw error;
+    }
     // Get seller's listings
     const { data: listings } = await supabase
       .from('listings')
@@ -1494,7 +1504,7 @@ app.post('/api/auth/signup', async (req, res) => {
   } catch (err) {
     console.error('[Signup] Error:', err.message);
     // Handle duplicate email
-    if (err.message?.includes('already registered') || err.message?.includes('already exists')) {
+    if (/already|exists/i.test(err?.message || '')) {
       return res.status(409).json({ error: 'An account with this email already exists' });
     }
     res.status(500).json({ error: err.message || 'Signup failed' });
