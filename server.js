@@ -1321,7 +1321,7 @@ app.get('/api/seller/:slug', async (req, res) => {
 app.post('/api/seller/register', async (req, res) => {
   try {
     if (!supabase) return res.status(503).json({ error: 'Database not available' });
-    const { userId, shopName, shopSlug, description, phone, email, address } = req.body;
+    const { userId, shopName, shopSlug, description, phone, email, address, businessRegistration, kraPin, idNumber, mpesaPhone } = req.body;
     if (!userId || !shopName || !shopSlug) {
       return res.status(400).json({ error: 'userId, shopName and shopSlug required' });
     }
@@ -1335,6 +1335,10 @@ app.post('/api/seller/register', async (req, res) => {
         phone: phone || null,
         email: email || null,
         address: address || null,
+        business_registration: businessRegistration || null,
+        kra_pin: kraPin || null,
+        id_number: idNumber || null,
+        mpesa_phone: mpesaPhone || null,
         status: 'pending',
         is_active: false,
       })
@@ -3473,6 +3477,20 @@ app.post('/api/affiliates/apply', async (req, res) => {
         loginUrl: `${process.env.FRONTEND_URL || 'https://stor1-web.onrender.com'}/login`,
       });
     }
+
+    // Notify admin of new application
+    emailLib.sendEmail({
+      to: process.env.ADMIN_EMAIL || 'omixsystems@gmail.com',
+      subject: `New Affiliate Application: ${full_name}`,
+      html: `<p><strong>${full_name}</strong> has applied for the affiliate program.</p>
+        <table cellpadding="6" style="font-size:14px;">
+          <tr><td style="color:#71717a;">Email</td><td>${email}</td></tr>
+          <tr><td style="color:#71717a;">Phone</td><td>${phone}</td></tr>
+          <tr><td style="color:#71717a;">M-Pesa</td><td>${mpesa_number}</td></tr>
+          <tr><td style="color:#71717a;">Location</td><td>${location || '—'}</td></tr>
+        </table>
+        <p><a href="${process.env.FRONTEND_URL || 'https://stor1-web.onrender.com'}/admin/affiliates" style="background:#ff385c;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:700;">Review Application</a></p>`,
+    }).catch(() => {});
 
     res.status(201).json({
       success: true,
