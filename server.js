@@ -1608,7 +1608,7 @@ const NIA_SYSTEM_PROMPT = `You are Nia, the friendly AI assistant for Omix Store
 - Affiliates get a unique referral code and link. Share on WhatsApp, social media, etc.
 - Dashboard at /affiliate-dashboard: see earnings, commissions, referrals, and request payouts.
 - Payouts via M-Pesa. Minimum payout: KES 2,000.
-- Refer customers via `?ref=CODE` in URL or enter referral code at checkout.
+- Refer customers via \`?ref=CODE\` in URL or enter referral code at checkout.
 
 ## Seller Features
 - Sellers can create an account and list products for sale.
