@@ -1485,6 +1485,8 @@ app.post('/api/auth/signup', async (req, res) => {
               status: 'pending',
               referral_code: refCode,
             });
+            // Also set the legacy profiles.referred_by column
+            await supabase.from('profiles').update({ referred_by: affiliate.id }).eq('id', userId);
           }
         }
       } catch (refErr) {
@@ -3021,6 +3023,10 @@ app.get('/api/admin/commissions', requireAdmin, async (req, res) => {
 // Approve commission
 app.patch('/api/admin/commissions/:id/approve', requireAdmin, async (req, res) => {
   try {
+    // Guard: only calculated commissions can be approved
+    const { data: existing } = await supabase.from('monthly_commissions').select('status').eq('id', req.params.id).single();
+    if (existing?.status !== 'calculated') return res.status(400).json({ success: false, error: `Cannot approve commission with status '${existing?.status}'. Must be 'calculated'.` });
+
     const { data, error } = await supabase
       .from('monthly_commissions')
       .update({ status: 'approved', approved_at: new Date().toISOString(), approved_by: req.user.id })
@@ -3046,6 +3052,10 @@ app.patch('/api/admin/commissions/:id/approve', requireAdmin, async (req, res) =
 app.patch('/api/admin/commissions/:id/pay', requireAdmin, async (req, res) => {
   try {
     const { paystack_reference } = req.body;
+
+    // Guard: only approved commissions can be marked paid
+    const { data: existing } = await supabase.from('monthly_commissions').select('status').eq('id', req.params.id).single();
+    if (existing?.status !== 'approved') return res.status(400).json({ success: false, error: `Cannot pay commission with status '${existing?.status}'. Must be 'approved'.` });
 
     const { data, error } = await supabase
       .from('monthly_commissions')
@@ -3533,6 +3543,10 @@ app.post('/api/affiliates/apply', async (req, res) => {
 // 4. GET /api/affiliate/referrals/:affiliateId — Recent referrals
 app.get('/api/affiliate/referrals/:affiliateId', requireAuth, async (req, res) => {
   try {
+    // Ownership check: verify the authenticated user owns this affiliate
+    const { data: affCheck } = await supabase.from('affiliates').select('user_id').eq('id', req.params.affiliateId).single();
+    if (!affCheck || affCheck.user_id !== req.user.id) return res.status(403).json({ error: 'Unauthorized' });
+
     const { limit = 20 } = req.query;
     // Fetch referrals first (no FK join — Supabase schema cache missing relations)
     const { data: referrals, error } = await supabase
@@ -3583,6 +3597,9 @@ app.get('/api/affiliate/referrals/:affiliateId', requireAuth, async (req, res) =
 // 5. GET /api/affiliate/commissions/:affiliateId — Monthly commissions
 app.get('/api/affiliate/commissions/:affiliateId', requireAuth, async (req, res) => {
   try {
+    const { data: affCheck } = await supabase.from('affiliates').select('user_id').eq('id', req.params.affiliateId).single();
+    if (!affCheck || affCheck.user_id !== req.user.id) return res.status(403).json({ error: 'Unauthorized' });
+
     const { limit = 12 } = req.query;
     const { data, error } = await supabase
       .from('monthly_commissions')
@@ -3603,6 +3620,8 @@ app.get('/api/affiliate/commissions/:affiliateId', requireAuth, async (req, res)
 // 6. GET /api/affiliate/orders/:affiliateId — Qualifying orders (referred users' paid orders)
 app.get('/api/affiliate/orders/:affiliateId', requireAuth, async (req, res) => {
   try {
+    const { data: affCheck } = await supabase.from('affiliates').select('user_id').eq('id', req.params.affiliateId).single();
+    if (!affCheck || affCheck.user_id !== req.user.id) return res.status(403).json({ error: 'Unauthorized' });
     const { limit = 20, status } = req.query;
 
     // Get referred user IDs
@@ -3700,6 +3719,9 @@ app.post('/api/affiliate/payout-request', requireAuth, async (req, res) => {
 // 8. GET /api/affiliate/payouts/:affiliateId — Payout history
 app.get('/api/affiliate/payouts/:affiliateId', requireAuth, async (req, res) => {
   try {
+    const { data: affCheck } = await supabase.from('affiliates').select('user_id').eq('id', req.params.affiliateId).single();
+    if (!affCheck || affCheck.user_id !== req.user.id) return res.status(403).json({ error: 'Unauthorized' });
+
     const { data, error } = await supabase
       .from('payout_requests')
       .select('*')
@@ -3734,6 +3756,9 @@ app.get('/api/affiliate/tiers', async (req, res) => {
 app.get('/api/affiliate/dashboard/:affiliateId', requireAuth, async (req, res) => {
   try {
     const affiliateId = req.params.affiliateId;
+    const { data: affCheck } = await supabase.from('affiliates').select('user_id').eq('id', affiliateId).single();
+    if (!affCheck || affCheck.user_id !== req.user.id) return res.status(403).json({ error: 'Unauthorized' });
+
     const now = new Date();
     const currentYear = now.getFullYear();
     const currentMonth = now.getMonth() + 1; // 1-indexed
