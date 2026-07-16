@@ -43,7 +43,10 @@ const limiter = rateLimit({
 });
 app.use('/api/', limiter);
 
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({
+  limit: '1mb',
+  verify: (req, _res, buf) => { req.rawBody = buf; },
+}));
 
 // ── XSS Protection: strip HTML tags from request bodies ──
 function sanitize(obj) {
@@ -1057,7 +1060,7 @@ app.get('/api/search', async (req, res) => {
 
 // ── Meilisearch Sync Endpoints ─────────────────────────────────────
 // POST /api/search/sync — index or update a product document
-app.post('/api/search/sync', async (req, res) => {
+app.post('/api/search/sync', requireAdmin, async (req, res) => {
   try {
     const { product } = req.body;
     if (!product || !product.id) {
@@ -1072,7 +1075,7 @@ app.post('/api/search/sync', async (req, res) => {
 });
 
 // DELETE /api/search/sync/:id — remove a product document
-app.delete('/api/search/sync/:id', async (req, res) => {
+app.delete('/api/search/sync/:id', requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     if (!id) {
@@ -1167,7 +1170,7 @@ app.post('/api/products/:id/questions', async (req, res) => {
 });
 
 // POST answer a question (admin)
-app.post('/api/questions/:id/answer', async (req, res) => {
+app.post('/api/questions/:id/answer', requireAdmin, async (req, res) => {
   try {
     if (!supabase) return res.status(503).json({ error: 'Database not available' });
     const { id } = req.params;
@@ -1244,7 +1247,7 @@ app.post('/api/admin/products/:id/wholesale', requireAdmin, async (req, res) => 
       const inserts = tiers.map(tier => ({
         listing_id: id,
         min_quantity: parseInt(tier.min_qty),
-        price: parseFloat(tier.price),
+        unit_price: parseFloat(tier.price),
       }));
 
       const { error: insertError } = await supabase
@@ -1649,6 +1652,7 @@ const NIA_MODELS = [
 ];
 
 app.post('/api/nia/chat', async (req, res) => {
+  try {
   const apiKey = process.env.HF_API_KEY;
 
   const { messages, userId, pageContext, cartItems } = req.body;
@@ -1847,6 +1851,10 @@ app.post('/api/nia/chat', async (req, res) => {
 
   // All models failed
   res.status(502).json({ error: `All AI models unavailable. ${lastError?.message || ''}` });
+  } catch (err) {
+    console.error('[Nia] Unhandled chat error:', err.message);
+    if (!res.headersSent) res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  }
 });
 
 // ── Initialize Paystack Inline Payment ─────────────────────────────────────────
@@ -1954,10 +1962,10 @@ app.get('/api/paystack/verify/:reference', async (req, res) => {
 });
 
 // ── Paystack Webhook ──
-app.post('/api/paystack/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+app.post('/api/paystack/webhook', async (req, res) => {
   try {
     const signature = req.headers['x-paystack-signature'];
-    const body = req.body;
+    const body = req.rawBody;
 
     // Verify webhook signature
     if (!signature) return res.status(401).json({ message: 'Missing signature' });
@@ -1996,7 +2004,7 @@ app.post('/api/paystack/webhook', express.raw({ type: 'application/json' }), asy
                 try {
                   // Fetch current stock
                   const { data: product } = await supabase
-                    .from('omix_listings')
+                    .from('listings')
                     .select('stock_quantity, quantity, status, purchase_count')
                     .eq('id', item.product_id)
                     .single();
@@ -2032,7 +2040,7 @@ app.post('/api/paystack/webhook', express.raw({ type: 'application/json' }), asy
                     }
 
                     await supabase
-                      .from('omix_listings')
+                      .from('listings')
                       .update(updateFields)
                       .eq('id', item.product_id);
 
@@ -2143,17 +2151,6 @@ const requireApiKey = (req, res, next) => {
 };
 
 // ── Public API endpoints for email services ─────────────────────────────────────
-
-// Debug: check email module state
-app.get('/api/debug/resend', (req, res) => {
-  res.json({
-    process_env: {
-      RESEND_API_KEY: process.env.RESEND_API_KEY ? 'SET (len=' + process.env.RESEND_API_KEY.length + ', chars=' + process.env.RESEND_API_KEY.charAt(0) + '...' + process.env.RESEND_API_KEY.slice(-4) + ')' : 'NOT SET',
-      RESEND_FROM: process.env.RESEND_FROM || 'NOT SET',
-    },
-    // We import the module fresh test below
-  });
-});
 
 // Send welcome email after user signup
 app.post('/api/email/welcome', requireApiKey, async (req, res) => {
@@ -2509,7 +2506,7 @@ app.get('/api/admin/analytics', requireAdmin, async (req, res) => {
 
     // App usage metrics
     const { data: totalListings } = await supabase
-      .from('omix_listings')
+      .from('listings')
       .select('id', { count: 'exact', head: true });
 
     const { data: totalUsers } = await supabase
@@ -3517,7 +3514,7 @@ app.post('/api/affiliates/apply', async (req, res) => {
           <tr><td style="color:#71717a;">Email</td><td>${email}</td></tr>
           <tr><td style="color:#71717a;">Phone</td><td>${phone}</td></tr>
           <tr><td style="color:#71717a;">M-Pesa</td><td>${mpesa_number}</td></tr>
-          <tr><td style="color:#71717a;">Location</td><td>${location || '—'}</td></tr>
+          <tr><td style="color:#71717a;">Location</td><td>${physical_address || '—'}</td></tr>
         </table>
         <p><a href="${process.env.FRONTEND_URL || 'https://stor1-web.onrender.com'}/admin/affiliates" style="background:#ff385c;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:700;">Review Application</a></p>`,
     }).catch(() => {});
