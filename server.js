@@ -1478,11 +1478,8 @@ app.post('/api/auth/signup', async (req, res) => {
           if (!existing) {
             await supabase.from('referrals').insert({
               affiliate_id: affiliate.id,
-              affiliate_user_id: affiliate.user_id,
               referred_user_id: userId,
-              referred_email: email,
               status: 'pending',
-              commission_rate: affiliate.tier === 'gold' ? 10.0 : 5.0,
               referral_code: refCode,
             });
           }
@@ -4784,6 +4781,21 @@ app.post('/api/admin/orders/:id/status',
     if (trackingError) throw trackingError;
 
     console.log(`[Tracking] Order ${id.slice(0, 8)} status updated to ${status}`);
+
+    // Send order status update email (fire-and-forget)
+    supabase.from('omix_orders').select('email, customer_name').eq('id', id).single()
+      .then(({ data: orderData }) => {
+        if (orderData?.email && status !== 'pending') {
+          emailLib.sendOrderStatusUpdate({
+            to: orderData.email,
+            orderId: id,
+            status,
+            customerName: orderData.customer_name || undefined,
+          }).catch((err) => console.warn('[Email] Order status email failed:', err.message));
+        }
+      })
+      .catch((err) => console.warn('[Email] Could not fetch order for status email:', err.message));
+
     res.json({ success: true, status, note: note || null });
   } catch (err) {
     console.error('[Tracking] POST admin error:', err.message);
@@ -4937,7 +4949,7 @@ app.get('/api/recommendations/trending', async (req, res) => {
 
 // ── Sitemap XML Endpoint ──────────────────────────────────────────────
 app.get('/api/sitemap.xml', async (req, res) => {
-  const siteUrl = process.env.SITE_URL || 'https://www.omixstore.co.ke';
+  const siteUrl = process.env.SITE_URL || 'https://market.omixsystems.store';
   const today = new Date().toISOString().split('T')[0];
 
   // Static pages
