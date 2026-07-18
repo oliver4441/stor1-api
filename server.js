@@ -2098,6 +2098,30 @@ app.post('/api/paystack/webhook', async (req, res) => {
               deliveryArea: existing.area,
               deliveryLandmark: existing.landmark,
             }).catch(err => console.error('[Email] Order confirmation failed:', err.message));
+
+            // Send referral reward email if this was a referred user's first paid order
+            supabase.from('referrals')
+              .select('affiliate_id, converted_at')
+              .eq('referred_user_id', existing.user_id)
+              .eq('status', 'converted')
+              .single()
+              .then(({ data: referral }) => {
+                if (referral) {
+                  supabase.from('affiliates').select('email, referral_code, full_name').eq('id', referral.affiliate_id).single()
+                    .then(({ data: aff }) => {
+                      if (aff?.email) {
+                        emailLib.sendReferralReward({
+                          to: aff.email,
+                          referralCode: aff.referral_code,
+                          rewardAmount: existing.total_amount ? Math.round(existing.total_amount * 0.05) : 100,
+                          customerName: aff.full_name,
+                        }).catch(err => console.warn('[Email] Referral reward failed:', err.message));
+                      }
+                    })
+                    .catch(() => {});
+                }
+              })
+              .catch(() => {});
           }
         } catch (dbErr) {
           console.error('[DB] Failed to process order:', dbErr.message);
@@ -2348,6 +2372,183 @@ app.post('/api/push/send', requireApiKey, async (req, res) => {
   } catch (err) {
     console.error('Push send error:', err);
     res.status(500).json({ message: 'Failed to send push notifications', error: err.message });
+  }
+});
+
+// ── Admin: List registered users (auth + profile role) ──
+app.get('/api/admin/users', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    const { data, error } = await supabase.auth.admin.listUsers();
+    if (error) throw error;
+    const authUsers = data.users || [];
+
+    // Pull profile roles in one shot
+    const { data: profiles } = await supabase
+      .from('profiles')
+      .select('id, full_name, role, created_at');
+
+    const roleMap = {};
+    (profiles || []).forEach(p => { roleMap[p.id] = p; });
+
+    const users = authUsers.map(u => {
+      const prof = roleMap[u.id] || {};
+      return {
+        id: u.id,
+        email: u.email,
+        phone: u.phone,
+        full_name: prof.full_name || u.user_metadata?.full_name || null,
+        role: prof.role || 'customer',
+        created_at: u.created_at,
+        last_sign_in: u.last_sign_in_at,
+        email_confirmed: !!u.email_confirmed_at,
+      };
+    }).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+    res.json({ success: true, users, count: users.length });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Admin: Delete a registered user (auth + profile) ──
+app.delete('/api/admin/users/:id', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    const { id } = req.params;
+    if (!id) return res.status(400).json({ success: false, error: 'user id required' });
+
+    // Guard: never delete the last admin
+    const { data: profile } = await supabase.from('profiles').select('role, email').eq('id', id).single();
+    if (profile?.role === 'admin') {
+      const { data: admins } = await supabase.from('profiles').select('id').eq('role', 'admin');
+      if ((admins?.length || 0) <= 1) {
+        return res.status(400).json({ success: false, error: 'Cannot delete the last remaining admin account' });
+      }
+    }
+
+    // Delete profile row first (FK), then auth user
+    await supabase.from('profiles').delete().eq('id', id);
+    const { error } = await supabase.auth.admin.deleteUser(id);
+    if (error) throw error;
+    res.json({ success: true, message: 'User deleted' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Admin: Broadcast email + push notification to all users ──
+app.post('/api/admin/broadcast', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    const { subject, body, sendEmail: doEmail = true, sendPush = true } = req.body;
+    if (!subject || !body) {
+      return res.status(400).json({ success: false, error: 'subject and body are required' });
+    }
+
+    // Collect all confirmed user emails
+    const { data: authUsers } = await supabase.auth.admin.listUsers();
+    const emails = (authUsers?.users || [])
+      .map(u => u.email)
+      .filter(Boolean);
+
+    let emailSent = 0;
+    if (doEmail && emails.length > 0) {
+      for (const to of emails) {
+        try {
+          await emailLib.sendEmail({ to, subject, html: `<div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:560px;margin:0 auto;padding:24px;color:#27272a"><h2 style="color:#ff385c;margin:0 0 16px">${subject}</h2><div style="font-size:15px;line-height:1.6;white-space:pre-wrap">${body.replace(/</g, '&lt;')}</div><hr style="border:none;border-top:1px solid #e4e4e7;margin:24px 0"><p style="font-size:12px;color:#71717a">Omix Store — Kericho, Kenya</p></div>` });
+          emailSent++;
+        } catch (e) { console.warn('[Broadcast] email failed for', to, e.message); }
+      }
+    }
+
+    // Fire-and-forget web push to all subscribers
+    let pushSent = 0;
+    if (sendPush) {
+      try {
+        const { data: subs } = await supabase
+          .from('push_subscriptions')
+          .select('endpoint, p256dh_key, auth_key');
+        if (subs && subs.length > 0) {
+          const payload = JSON.stringify({
+            title: subject,
+            body: body.slice(0, 200),
+            tag: 'omix-broadcast',
+            data: { url: '/' },
+          });
+          for (const sub of subs) {
+            try {
+              await webpush.sendNotification({
+                endpoint: sub.endpoint,
+                keys: { p256dh: sub.p256dh_key, auth: sub.auth_key },
+              }, payload);
+              pushSent++;
+            } catch { /* ignore expired subs */ }
+          }
+        }
+      } catch (e) { console.warn('[Broadcast] push failed', e.message); }
+    }
+
+    res.json({ success: true, emailSent, pushSent, totalUsers: emails.length });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── User: Delete own account (auth + profile) ──
+app.delete('/api/users/me', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    const userId = req.user.id;
+
+    const { data: profile } = await supabase.from('profiles').select('role').eq('id', userId).single();
+    if (profile?.role === 'admin') {
+      const { data: admins } = await supabase.from('profiles').select('id').eq('role', 'admin');
+      if ((admins?.length || 0) <= 1) {
+        return res.status(400).json({ success: false, error: 'The last admin cannot delete their own account' });
+      }
+    }
+
+    await supabase.from('profiles').delete().eq('id', userId);
+    const { error } = await supabase.auth.admin.deleteUser(userId);
+    if (error) throw error;
+    res.json({ success: true, message: 'Account deleted' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Affiliate: Remove own affiliate account permanently ──
+app.delete('/api/affiliate/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    const { id } = req.params;
+    if (!id) return res.status(400).json({ success: false, error: 'affiliate id required' });
+
+    // Only the owner of the affiliate record (or an admin) may delete it
+    const { data: aff } = await supabase.from('affiliates').select('user_id').eq('id', id).single();
+    if (!aff) return res.status(404).json({ success: false, error: 'Affiliate not found' });
+
+    const isOwner = aff.user_id === req.user.id;
+    let isAdmin = false;
+    if (!isOwner) {
+      const { data: prof } = await supabase.from('profiles').select('role').eq('id', req.user.id).single();
+      isAdmin = prof?.role === 'admin';
+    }
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ success: false, error: 'Not authorized' });
+    }
+
+    // Delete related rows then the affiliate record
+    await supabase.from('referrals').delete().eq('affiliate_id', id);
+    await supabase.from('referral_clicks').delete().eq('affiliate_id', id);
+    await supabase.from('affiliate_commissions').delete().eq('affiliate_id', id);
+    await supabase.from('monthly_commissions').delete().eq('affiliate_id', id);
+    await supabase.from('affiliates').delete().eq('id', id);
+
+    res.json({ success: true, message: 'Affiliate account removed' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -3211,6 +3412,23 @@ app.patch('/api/admin/payout-requests/:id/approve', requireAdmin, async (req, re
       event_type: action === 'approve' ? 'PAYOUT_APPROVED' : 'PAYOUT_REJECTED',
       details: { payout_id: id, amount: payout.amount, admin_notes, [action === 'approve' ? 'approved_by' : 'processed_by']: req.user.id },
     });
+
+    // Send payout confirmation email
+    if (action === 'approve') {
+      supabase.from('affiliates').select('email, full_name').eq('id', payout.affiliate_id).single()
+        .then(({ data: aff }) => {
+          if (aff?.email) {
+            emailLib.sendPayoutConfirmation({
+              to: aff.email,
+              name: aff.full_name,
+              amount: payout.amount,
+              paymentMethod: payout.payment_method || 'M-Pesa',
+              payoutDate: new Date().toISOString(),
+            }).catch(err => console.warn('[Email] Payout confirmation failed:', err.message));
+          }
+        })
+        .catch(err => console.warn('[Email] Could not fetch affiliate for payout email:', err.message));
+    }
 
     res.json({ success: true, data: payout });
   } catch (err) {
