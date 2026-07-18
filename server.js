@@ -3,6 +3,7 @@
 // Deploy to Render/Railway/Fly.io as a separate service
 
 import 'dotenv/config';
+import 'express-async-errors';
 import crypto from 'crypto';
 import express from 'express';
 import cors from 'cors';
@@ -37,11 +38,17 @@ app.use(cors({
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100, // limit each IP to 100 requests per window
-  standardHeaders: true,
-  legacyHeaders: false,
   message: { error: 'Too many requests, please try again later.' }
 });
 app.use('/api/', limiter);
+
+// Stricter limit for auth routes (brute-force protection)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10, // 10 attempts per 15 min per IP
+  message: { error: 'Too many login attempts, please try again later.' }
+});
+app.use('/api/auth/', authLimiter);
 
 app.use(express.json({
   limit: '1mb',
@@ -3252,6 +3259,10 @@ async function requireAuth(req, res, next) {
 // 1. GET /api/affiliate/profile/:userId — Get affiliate by user ID
 app.get('/api/affiliate/profile/:userId', requireAuth, async (req, res) => {
   try {
+    // IDOR guard: only the owner or an admin can view this profile
+    if (req.params.userId !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ success: false, error: 'Forbidden' });
+    }
     const { data, error } = await supabase
       .from('affiliates')
       .select('*')
@@ -5188,6 +5199,12 @@ function generateFallbackComparison(products) {
 
   return lines.join('\n');
 }
+
+// Global error handler — catches anything express-async-errors forwards
+app.use((err, req, res, next) => {
+  console.error('[Unhandled Error]', err?.message || err);
+  res.status(500).json({ success: false, error: 'Internal server error' });
+});
 
 // API-only: no SPA fallback — unmatched routes return 404 JSON
 
