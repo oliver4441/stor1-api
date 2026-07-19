@@ -2472,6 +2472,7 @@ app.post('/api/admin/apply-migrations', requireAdmin, async (req, res) => {
           console.error('[Migrate]', f, 'stmt failed:', error.message, '|| STMT:', stmt.slice(0, 200));
           return res.status(500).json({ error: `Migration ${f} failed`, detail: error.message, stmt: stmt.slice(0, 200) });
         }
+        await new Promise(r => setTimeout(r, 250));
       }
       applied.push(f);
     }
