@@ -2445,7 +2445,8 @@ app.post('/api/admin/apply-migrations', requireAdmin, async (req, res) => {
     const fs = await import('fs');
     const path = await import('path');
     const migDir = path.default.join(process.cwd(), 'supabase', 'migrations');
-    const files = fs.default.readdirSync(migDir).filter(f => f.endsWith('.sql')).sort();
+    const files = fs.default.readdirSync(migDir).filter(f => f.endsWith('.sql')).sort()
+      .filter(f => f.startsWith('20260719') || f.includes('webauthn') || f.includes('broadcast'));
     const SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
     const SUPABASE_URL = process.env.SUPABASE_URL;
     if (!SERVICE_KEY || !SUPABASE_URL) return res.status(500).json({ error: 'Service key not available' });
