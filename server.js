@@ -2026,6 +2026,21 @@ app.delete('/api/affiliate/:id', requireAuth, async (req, res) => {
 });
 
 
+// TEMP storage probe
+app.post('/api/admin/_storage_test', requireAdmin, async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'no supabase' });
+  try {
+    const { error: be } = await supabase.storage.createBucket('app-config', { public: false });
+    const { data: up, error: ue } = await supabase.storage.from('app-config').upload('probe.json', JSON.stringify({ ok: true }), { upsert: true, contentType: 'application/json' });
+    const { data: dl, error: de } = await supabase.storage.from('app-config').download('probe.json');
+    let txt = '';
+    if (dl) txt = await dl.text();
+    res.json({ bucketErr: be?.message || null, upload: up, uploadErr: ue?.message || null, downloadTxt: txt, dlErr: de?.message || null });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Admin Analytics Endpoint ──────────────────────────────────
 app.get('/api/admin/analytics', requireAdmin, async (req, res) => {
   if (!supabase) return res.status(500).json({ message: 'Supabase not configured' });
