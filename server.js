@@ -2447,21 +2447,31 @@ app.post('/api/admin/apply-migrations', requireAdmin, async (req, res) => {
     const migDir = path.default.join(process.cwd(), 'supabase', 'migrations');
     const files = fs.default.readdirSync(migDir).filter(f => f.endsWith('.sql')).sort()
       .filter(f => f.startsWith('20260719') || f.includes('webauthn') || f.includes('broadcast'));
-    const SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-    const SUPABASE_URL = process.env.SUPABASE_URL;
-    if (!SERVICE_KEY || !SUPABASE_URL) return res.status(500).json({ error: 'Service key not available' });
+    // Split SQL into individual statements and run via the project's exec_sql RPC (per-statement, like create_participants_table.cjs)
+    function splitStatements(sql) {
+      const out = [];
+      let cur = '', inString = false, ch;
+      for (let i = 0; i < sql.length; i++) {
+        ch = sql[i];
+        if (ch === "'") inString = !inString;
+        if (ch === ';' && !inString) {
+          if (cur.trim()) out.push(cur.trim());
+          cur = '';
+        } else cur += ch;
+      }
+      if (cur.trim()) out.push(cur.trim());
+      return out.filter(s => s && !s.startsWith('--'));
+    }
     const applied = [];
     for (const f of files) {
       const sqlText = fs.default.readFileSync(path.default.join(migDir, f), 'utf8');
-      const r = await fetch(`${SUPABASE_URL}/rest/v1/sql`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${SERVICE_KEY}`, 'apikey': SERVICE_KEY, 'Content-Type': 'application/json' },
-        body: JSON.stringify(sqlText),
-      });
-      if (!r.ok) {
-        const err = await r.text();
-        console.error('[Migrate]', f, 'failed:', err);
-        return res.status(500).json({ error: `Migration ${f} failed`, detail: err });
+      const stmts = splitStatements(sqlText);
+      for (const stmt of stmts) {
+        const { error } = await supabase.rpc('exec_sql', { sql: stmt });
+        if (error) {
+          console.error('[Migrate]', f, 'stmt failed:', error.message);
+          return res.status(500).json({ error: `Migration ${f} failed`, detail: error.message });
+        }
       }
       applied.push(f);
     }
