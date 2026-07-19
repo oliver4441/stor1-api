@@ -2452,11 +2452,11 @@ app.post('/api/admin/apply-migrations', requireAdmin, async (req, res) => {
     if (!SERVICE_KEY || !SUPABASE_URL) return res.status(500).json({ error: 'Service key not available' });
     const applied = [];
     for (const f of files) {
-      const sql = fs.default.readFileSync(path.default.join(migDir, f), 'utf8');
-      const r = await fetch(`${SUPABASE_URL}/sql`, {
+      const sqlText = fs.default.readFileSync(path.default.join(migDir, f), 'utf8');
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/sql`, {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${SERVICE_KEY}`, 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body: JSON.stringify({ query: sql }),
+        headers: { 'Authorization': `Bearer ${SERVICE_KEY}`, 'Content-Type': 'text/plain' },
+        body: sqlText,
       });
       if (!r.ok) {
         const err = await r.text();
