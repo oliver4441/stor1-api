@@ -1730,7 +1730,7 @@ app.get('/api/admin/broadcast/settings', requireAdmin, async (req, res) => {
     const data = await storageGetJSON('broadcast_settings.json');
     res.json({ success: true, settings: data || { enabled: true, default_email: true, default_push: true } });
   } catch (err) {
-    res.json({ success: true, settings: { enabled: true, default_email: true, default_push: true } });
+    res.status(500).json({ error: 'GET failed: ' + err.message });
   }
 });
 
