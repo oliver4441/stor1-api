@@ -15,6 +15,7 @@ import { InferenceClient } from '@huggingface/inference';
 import emailLib from './lib/email.js';
 import rateLimit from 'express-rate-limit';
 import { body, param, validationResult } from 'express-validator';
+import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } from '@simplewebauthn/server';
 import * as meiliSearch from './lib/meilisearch.js';
 
 const app = express();
@@ -2437,14 +2438,241 @@ app.delete('/api/admin/users/:id', requireAdmin, async (req, res) => {
   }
 });
 
+// ── Admin: Apply pending DB migrations (idempotent, admin-only) ──
+app.post('/api/admin/apply-migrations', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    const fs = await import('fs');
+    const path = await import('path');
+    const migDir = path.default.join(process.cwd(), 'supabase', 'migrations');
+    const files = fs.default.readdirSync(migDir).filter(f => f.endsWith('.sql')).sort();
+    const SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+    const SUPABASE_URL = process.env.SUPABASE_URL;
+    if (!SERVICE_KEY || !SUPABASE_URL) return res.status(500).json({ error: 'Service key not available' });
+    const applied = [];
+    for (const f of files) {
+      const sql = fs.default.readFileSync(path.default.join(migDir, f), 'utf8');
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/sql`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${SERVICE_KEY}`, 'Content-Type': 'application/json', 'Prefer': 'params=single-object' },
+        body: JSON.stringify({ query: sql }),
+      });
+      if (!r.ok) {
+        const err = await r.text();
+        console.error('[Migrate]', f, 'failed:', err);
+        return res.status(500).json({ error: `Migration ${f} failed`, detail: err });
+      }
+      applied.push(f);
+    }
+    res.json({ success: true, applied });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Admin: Get/Update broadcast settings (master toggle + default channels) ──
+app.get('/api/admin/broadcast/settings', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    const { data } = await supabase.from('site_settings').select('value').eq('key', 'broadcast').single();
+    res.json({ success: true, settings: data?.value || { enabled: true, default_email: true, default_push: true } });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/admin/broadcast/settings', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    const { enabled, default_email, default_push } = req.body;
+    const settings = {
+      enabled: enabled !== undefined ? !!enabled : true,
+      default_email: default_email !== undefined ? !!default_email : true,
+      default_push: default_push !== undefined ? !!default_push : true,
+    };
+    await supabase.from('site_settings').upsert({ key: 'broadcast', value: settings, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+    res.json({ success: true, settings });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+//  WEBAUTHN (BIOMETRIC / PASSKEY) — user-facing
+// ═══════════════════════════════════════════════════════════════
+
+// List registered biometric credentials for current user
+app.get('/api/webauthn/credentials', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    const { data } = await supabase
+      .from('webauthn_credentials')
+      .select('id, device_name, created_at')
+      .eq('user_id', req.user.id)
+      .order('created_at', { ascending: false });
+    res.json({ success: true, credentials: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Remove a biometric credential
+app.delete('/api/webauthn/credentials/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    await supabase.from('webauthn_credentials').delete().eq('id', req.params.id).eq('user_id', req.user.id);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Begin registration (returns options to pass to navigator.credentials.create)
+app.post('/api/webauthn/register/begin', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    const userId = req.user.id;
+    const { data: profile } = await supabase.from('profiles').select('email, full_name').eq('id', userId).single();
+    const { data: existing } = await supabase.from('webauthn_credentials').select('credential_id').eq('user_id', userId);
+    const options = await generateRegistrationOptions({
+      rpName: RP_NAME,
+      rpID: RP_ID,
+      userName: profile?.email || userId,
+      userID: Buffer.from(userId),
+      userDisplayName: profile?.full_name || profile?.email || 'Omix User',
+      attestationType: 'none',
+      excludeCredentials: (existing || []).map(c => ({ id: c.credential_id })),
+      authenticatorSelection: { residentKey: 'preferred', userVerification: 'preferred' },
+      supportedAlgorithmIDs: [-7, -257],
+    });
+    await supabase.from('webauthn_challenges').upsert({
+      user_id: userId, challenge: options.challenge, purpose: 'register', created_at: new Date().toISOString(),
+    }, { onConflict: 'user_id' });
+    res.json({ success: true, options });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Complete registration (verify attestation, store credential)
+app.post('/api/webauthn/register/complete', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    const userId = req.user.id;
+    const { data: chal } = await supabase.from('webauthn_challenges').select('challenge').eq('user_id', userId).eq('purpose', 'register').single();
+    if (!chal) return res.status(400).json({ error: 'No active registration challenge' });
+    const verification = await verifyRegistrationResponse({
+      response: req.body,
+      expectedChallenge: chal.challenge,
+      expectedOrigin: RP_ORIGIN,
+      expectedRPID: RP_ID,
+    });
+    if (!verification.verified || !verification.registrationInfo) {
+      return res.status(400).json({ error: 'Registration verification failed' });
+    }
+    const { credential } = verification.registrationInfo;
+    const deviceName = req.body.deviceName || 'Biometric device';
+    await supabase.from('webauthn_credentials').insert({
+      user_id: userId,
+      credential_id: credential.id,
+      public_key: Buffer.from(credential.publicKey).toString('base64'),
+      counter: credential.counter,
+      device_name: deviceName,
+    });
+    await supabase.from('webauthn_challenges').delete().eq('user_id', userId).eq('purpose', 'register');
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Begin login (returns options to pass to navigator.credentials.get)
+app.post('/api/webauthn/login/begin', async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'email required' });
+    const { data: profile } = await supabase.from('profiles').select('id').eq('email', email).single();
+    if (!profile) return res.status(404).json({ error: 'No account found' });
+    const { data: creds } = await supabase.from('webauthn_credentials').select('credential_id').eq('user_id', profile.id);
+    if (!creds || creds.length === 0) return res.status(404).json({ error: 'No biometric credentials for this account' });
+    const options = await generateAuthenticationOptions({
+      rpID: RP_ID,
+      allowCredentials: creds.map(c => ({ id: c.credential_id })),
+      userVerification: 'preferred',
+    });
+    await supabase.from('webauthn_challenges').upsert({
+      user_id: profile.id, challenge: options.challenge, purpose: 'login', created_at: new Date().toISOString(),
+    }, { onConflict: 'user_id' });
+    res.json({ success: true, options, userId: profile.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Complete login (verify assertion, return userId so client can establish session)
+app.post('/api/webauthn/login/complete', async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    const { userId, response } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const { data: chal } = await supabase.from('webauthn_challenges').select('challenge').eq('user_id', userId).eq('purpose', 'login').single();
+    if (!chal) return res.status(400).json({ error: 'No active login challenge' });
+    const { data: cred } = await supabase.from('webauthn_credentials').select('*').eq('user_id', userId).eq('credential_id', response.id).single();
+    if (!cred) return res.status(404).json({ error: 'Unknown credential' });
+    const verification = await verifyAuthenticationResponse({
+      response,
+      expectedChallenge: chal.challenge,
+      expectedOrigin: RP_ORIGIN,
+      expectedRPID: RP_ID,
+      credential: {
+        id: cred.credential_id,
+        publicKey: Buffer.from(cred.public_key, 'base64'),
+        counter: Number(cred.counter),
+        transports: ['internal', 'hybrid'],
+      },
+    });
+    if (!verification.verified) return res.status(400).json({ error: 'Login verification failed' });
+    await supabase.from('webauthn_credentials').update({ counter: verification.authenticationInfo.newCounter }).eq('id', cred.id);
+    await supabase.from('webauthn_challenges').delete().eq('user_id', userId).eq('purpose', 'login');
+    // Issue a Supabase session for the verified user (service-role)
+    const { data: sessionData, error: sessErr } = await supabase.auth.admin.signInWithId({ userId });
+    if (sessErr || !sessionData?.session) {
+      return res.status(500).json({ error: sessErr?.message || 'Could not start session' });
+    }
+    res.json({
+      success: true,
+      session: {
+        access_token: sessionData.session.access_token,
+        refresh_token: sessionData.session.refresh_token,
+        token_type: sessionData.session.token_type,
+        expires_in: sessionData.session.expires_in,
+        expires_at: sessionData.session.expires_at,
+        user: sessionData.session.user,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Admin: Broadcast email + push notification to all users ──
 app.post('/api/admin/broadcast', requireAdmin, async (req, res) => {
   try {
     if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
-    const { subject, body, sendEmail: doEmail = true, sendPush = true } = req.body;
+    const { subject, body, sendEmail: doEmail, sendPush } = req.body;
     if (!subject || !body) {
       return res.status(400).json({ success: false, error: 'subject and body are required' });
     }
+
+    // Respect master toggle from settings
+    const { data: settingRow } = await supabase.from('site_settings').select('value').eq('key', 'broadcast').single();
+    const settings = settingRow?.value || { enabled: true, default_email: true, default_push: true };
+    if (settings.enabled === false) {
+      return res.status(403).json({ success: false, error: 'Broadcast is currently disabled in settings. Enable it to send.' });
+    }
+    const emailOn = doEmail !== undefined ? doEmail : settings.default_email;
+    const pushOn = sendPush !== undefined ? sendPush : settings.default_push;
 
     // Collect all confirmed user emails
     const { data: authUsers } = await supabase.auth.admin.listUsers();
@@ -2453,10 +2681,10 @@ app.post('/api/admin/broadcast', requireAdmin, async (req, res) => {
       .filter(Boolean);
 
     let emailSent = 0;
-    if (doEmail && emails.length > 0) {
+    if (emailOn && emails.length > 0) {
       for (const to of emails) {
         try {
-          await emailLib.sendEmail({ to, subject, html: `<div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:560px;margin:0 auto;padding:24px;color:#27272a"><h2 style="color:#ff385c;margin:0 0 16px">${subject}</h2><div style="font-size:15px;line-height:1.6;white-space:pre-wrap">${body.replace(/</g, '&lt;')}</div><hr style="border:none;border-top:1px solid #e4e4e7;margin:24px 0"><p style="font-size:12px;color:#71717a">Omix Store — Kericho, Kenya</p></div>` });
+          await emailLib.sendEmail({ to, subject, html: emailLib.emailWrapper({ title: subject, content: `<div style="font-size:15px;line-height:1.6;white-space:pre-wrap;color:#27272a">${body.replace(/</g, '&lt;')}</div><p style="font-size:12px;color:#71717a;margin-top:24px;">Omix Store — Kericho, Kenya</p>` }) });
           emailSent++;
         } catch (e) { console.warn('[Broadcast] email failed for', to, e.message); }
       }
@@ -2464,7 +2692,7 @@ app.post('/api/admin/broadcast', requireAdmin, async (req, res) => {
 
     // Fire-and-forget web push to all subscribers
     let pushSent = 0;
-    if (sendPush) {
+    if (pushOn) {
       try {
         const { data: subs } = await supabase
           .from('push_subscriptions')
@@ -2972,7 +3200,7 @@ app.patch('/api/admin/affiliates/:id/approve', requireAdmin, async (req, res) =>
         });
 
         // In-app notification
-        await supabase.from('in_app_notifications').insert({
+        await supabase.from('notifications').insert({
           user_id: affiliateData.user_id,
           type: 'AFFILIATE_APPROVED',
           title: 'Affiliate Application Approved',
@@ -2988,7 +3216,7 @@ app.patch('/api/admin/affiliates/:id/approve', requireAdmin, async (req, res) =>
         });
 
         // In-app notification
-        await supabase.from('in_app_notifications').insert({
+        await supabase.from('notifications').insert({
           user_id: affiliateData.user_id,
           type: 'AFFILIATE_REJECTED',
           title: 'Affiliate Application Update',
