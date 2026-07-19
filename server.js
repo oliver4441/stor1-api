@@ -18,6 +18,13 @@ import { body, param, validationResult } from 'express-validator';
 import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } from '@simplewebauthn/server';
 import * as meiliSearch from './lib/meilisearch.js';
 
+// ── WebAuthn (biometric/passkey) config ──
+const RP_NAME = 'Omix Store';
+const FRONTEND_ORIGIN = process.env.FRONTEND_URL || 'https://stor1-web.onrender.com';
+const RP_ORIGIN = FRONTEND_ORIGIN;
+// RP_ID must be the registrable domain (hostname) of the frontend origin
+const RP_ID = (() => { try { return new URL(FRONTEND_ORIGIN).hostname; } catch { return 'stor1-web.onrender.com'; } })();
+
 const app = express();
 app.use(helmet({
   contentSecurityPolicy: false,
@@ -1730,7 +1737,7 @@ app.get('/api/admin/broadcast/settings', requireAdmin, async (req, res) => {
     const data = await storageGetJSON('broadcast_settings.json');
     res.json({ success: true, settings: data || { enabled: true, default_email: true, default_push: true } });
   } catch (err) {
-    res.status(500).json({ error: 'GET failed: ' + err.message });
+    res.json({ success: true, settings: { enabled: true, default_email: true, default_push: true } });
   }
 });
 
