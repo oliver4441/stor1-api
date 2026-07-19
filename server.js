@@ -1700,13 +1700,35 @@ app.delete('/api/admin/users/:id', requireAdmin, async (req, res) => {
 });
 
 
+// ── Storage-backed config (no DDL needed) ──
+// Uses a private Supabase Storage bucket 'app-config' to persist settings + webauthn data.
+const CONFIG_BUCKET = 'app-config';
+async function ensureConfigBucket() {
+  if (!supabase) return;
+  const { error } = await supabase.storage.createBucket(CONFIG_BUCKET, { public: false });
+  // ignore "already exists" errors
+}
+async function storageGetJSON(path) {
+  const { data } = await supabase.storage.from(CONFIG_BUCKET).download(path);
+  if (!data) return null;
+  const txt = await data.text();
+  return JSON.parse(txt);
+}
+async function storagePutJSON(path, obj) {
+  const { error } = await supabase.storage.from(CONFIG_BUCKET).upload(path, JSON.stringify(obj), { upsert: true, contentType: 'application/json' });
+  if (error) throw error;
+}
+async function storageDelete(path) {
+  await supabase.storage.from(CONFIG_BUCKET).remove([path]);
+}
+
 // ── Admin: Get/Update broadcast settings (master toggle + default channels) ──
-// Stored as a single row in `notifications` with type='broadcast_settings' (avoids needing a new table)
+// Persisted as app-config/broadcast_settings.json
 app.get('/api/admin/broadcast/settings', requireAdmin, async (req, res) => {
   try {
     if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
-    const { data } = await supabase.from('notifications').select('data').eq('type', 'broadcast_settings').single();
-    res.json({ success: true, settings: data?.data || { enabled: true, default_email: true, default_push: true } });
+    const data = await storageGetJSON('broadcast_settings.json');
+    res.json({ success: true, settings: data || { enabled: true, default_email: true, default_push: true } });
   } catch (err) {
     res.json({ success: true, settings: { enabled: true, default_email: true, default_push: true } });
   }
@@ -1721,12 +1743,7 @@ app.put('/api/admin/broadcast/settings', requireAdmin, async (req, res) => {
       default_email: default_email !== undefined ? !!default_email : true,
       default_push: default_push !== undefined ? !!default_push : true,
     };
-    const { data: existing } = await supabase.from('notifications').select('id').eq('type', 'broadcast_settings').single();
-    if (existing) {
-      await supabase.from('notifications').update({ data: settings, updated_at: new Date().toISOString() }).eq('id', existing.id);
-    } else {
-      await supabase.from('notifications').insert({ type: 'broadcast_settings', title: 'Broadcast settings', data: settings, created_at: new Date().toISOString() });
-    }
+    await storagePutJSON('broadcast_settings.json', settings);
     res.json({ success: true, settings });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1735,21 +1752,21 @@ app.put('/api/admin/broadcast/settings', requireAdmin, async (req, res) => {
 
 // ═══════════════════════════════════════════════════════════════
 //  WEBAUTHN (BIOMETRIC / PASSKEY) — user-facing
+//  Credentials + challenges persisted in app-config/ storage (no DDL)
 // ═══════════════════════════════════════════════════════════════
+
+function credPath(userId) { return `webauthn/${userId}.json`; }
+function chalPath(userId) { return `webauthn_challenge/${userId}.json`; }
 
 // List registered biometric credentials for current user
 app.get('/api/webauthn/credentials', requireAuth, async (req, res) => {
   try {
     if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
-    const { data } = await supabase
-      .from('notifications')
-      .select('id, data')
-      .eq('type', 'webauthn_cred')
-      .eq('user_id', req.user.id);
-    const credentials = (data || []).map(r => ({
-      id: r.id,
-      device_name: r.data?.device_name || 'Biometric device',
-      created_at: r.data?.created_at,
+    const creds = await storageGetJSON(credPath(req.user.id)) || [];
+    const credentials = creds.map(c => ({
+      id: c.credential_id,
+      device_name: c.device_name || 'Biometric device',
+      created_at: c.created_at,
     }));
     res.json({ success: true, credentials });
   } catch (err) {
@@ -1761,7 +1778,9 @@ app.get('/api/webauthn/credentials', requireAuth, async (req, res) => {
 app.delete('/api/webauthn/credentials/:id', requireAuth, async (req, res) => {
   try {
     if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
-    await supabase.from('notifications').delete().eq('id', req.params.id).eq('type', 'webauthn_cred').eq('user_id', req.user.id);
+    const creds = await storageGetJSON(credPath(req.user.id)) || [];
+    const next = creds.filter(c => c.credential_id !== req.params.id);
+    await storagePutJSON(credPath(req.user.id), next);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1774,7 +1793,7 @@ app.post('/api/webauthn/register/begin', requireAuth, async (req, res) => {
     if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
     const userId = req.user.id;
     const { data: profile } = await supabase.from('profiles').select('email, full_name').eq('id', userId).single();
-    const { data: existing } = await supabase.from('notifications').select('data').eq('type', 'webauthn_cred').eq('user_id', userId);
+    const existing = await storageGetJSON(credPath(userId)) || [];
     const options = await generateRegistrationOptions({
       rpName: RP_NAME,
       rpID: RP_ID,
@@ -1782,13 +1801,11 @@ app.post('/api/webauthn/register/begin', requireAuth, async (req, res) => {
       userID: Buffer.from(userId),
       userDisplayName: profile?.full_name || profile?.email || 'Omix User',
       attestationType: 'none',
-      excludeCredentials: (existing || []).map(c => ({ id: c.data.credential_id })),
+      excludeCredentials: existing.map(c => ({ id: c.credential_id })),
       authenticatorSelection: { residentKey: 'preferred', userVerification: 'preferred' },
       supportedAlgorithmIDs: [-7, -257],
     });
-    await supabase.from('notifications').upsert({
-      type: 'webauthn_challenge', user_id: userId, data: { challenge: options.challenge, purpose: 'register' }, created_at: new Date().toISOString(),
-    }, { onConflict: 'type,user_id' });
+    await storagePutJSON(chalPath(userId), { challenge: options.challenge, purpose: 'register', created_at: new Date().toISOString() });
     res.json({ success: true, options });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1800,11 +1817,11 @@ app.post('/api/webauthn/register/complete', requireAuth, async (req, res) => {
   try {
     if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
     const userId = req.user.id;
-    const { data: chal } = await supabase.from('notifications').select('data').eq('type', 'webauthn_challenge').eq('user_id', userId).eq('data->>purpose', 'register').single();
-    if (!chal) return res.status(400).json({ error: 'No active registration challenge' });
+    const chal = await storageGetJSON(chalPath(userId));
+    if (!chal || chal.purpose !== 'register') return res.status(400).json({ error: 'No active registration challenge' });
     const verification = await verifyRegistrationResponse({
       response: req.body,
-      expectedChallenge: chal.data.challenge,
+      expectedChallenge: chal.challenge,
       expectedOrigin: RP_ORIGIN,
       expectedRPID: RP_ID,
     });
@@ -1813,18 +1830,16 @@ app.post('/api/webauthn/register/complete', requireAuth, async (req, res) => {
     }
     const { credential } = verification.registrationInfo;
     const deviceName = req.body.deviceName || 'Biometric device';
-    await supabase.from('notifications').insert({
-      type: 'webauthn_cred', user_id: userId,
-      data: {
-        credential_id: credential.id,
-        public_key: Buffer.from(credential.publicKey).toString('base64'),
-        counter: credential.counter,
-        device_name: deviceName,
-        created_at: new Date().toISOString(),
-      },
+    const creds = await storageGetJSON(credPath(userId)) || [];
+    creds.push({
+      credential_id: credential.id,
+      public_key: Buffer.from(credential.publicKey).toString('base64'),
+      counter: credential.counter,
+      device_name: deviceName,
       created_at: new Date().toISOString(),
     });
-    await supabase.from('notifications').delete().eq('type', 'webauthn_challenge').eq('user_id', userId).eq('data->>purpose', 'register');
+    await storagePutJSON(credPath(userId), creds);
+    await storageDelete(chalPath(userId));
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1839,16 +1854,14 @@ app.post('/api/webauthn/login/begin', async (req, res) => {
     if (!email) return res.status(400).json({ error: 'email required' });
     const { data: profile } = await supabase.from('profiles').select('id').eq('email', email).single();
     if (!profile) return res.status(404).json({ error: 'No account found' });
-    const { data: creds } = await supabase.from('notifications').select('data').eq('type', 'webauthn_cred').eq('user_id', profile.id);
+    const creds = await storageGetJSON(credPath(profile.id)) || [];
     if (!creds || creds.length === 0) return res.status(404).json({ error: 'No biometric credentials for this account' });
     const options = await generateAuthenticationOptions({
       rpID: RP_ID,
-      allowCredentials: creds.map(c => ({ id: c.data.credential_id })),
+      allowCredentials: creds.map(c => ({ id: c.credential_id })),
       userVerification: 'preferred',
     });
-    await supabase.from('notifications').upsert({
-      type: 'webauthn_challenge', user_id: profile.id, data: { challenge: options.challenge, purpose: 'login' }, created_at: new Date().toISOString(),
-    }, { onConflict: 'type,user_id' });
+    await storagePutJSON(chalPath(profile.id), { challenge: options.challenge, purpose: 'login', created_at: new Date().toISOString() });
     res.json({ success: true, options, userId: profile.id });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1861,25 +1874,27 @@ app.post('/api/webauthn/login/complete', async (req, res) => {
     if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
     const { userId, response } = req.body;
     if (!userId) return res.status(400).json({ error: 'userId required' });
-    const { data: chal } = await supabase.from('notifications').select('data').eq('type', 'webauthn_challenge').eq('user_id', userId).eq('data->>purpose', 'login').single();
-    if (!chal) return res.status(400).json({ error: 'No active login challenge' });
-    const { data: cred } = await supabase.from('notifications').select('*').eq('type', 'webauthn_cred').eq('user_id', userId).eq('data->>credential_id', response.id).single();
+    const chal = await storageGetJSON(chalPath(userId));
+    if (!chal || chal.purpose !== 'login') return res.status(400).json({ error: 'No active login challenge' });
+    const creds = await storageGetJSON(credPath(userId)) || [];
+    const cred = creds.find(c => c.credential_id === response.id);
     if (!cred) return res.status(404).json({ error: 'Unknown credential' });
     const verification = await verifyAuthenticationResponse({
       response,
-      expectedChallenge: chal.data.challenge,
+      expectedChallenge: chal.challenge,
       expectedOrigin: RP_ORIGIN,
       expectedRPID: RP_ID,
       credential: {
-        id: cred.data.credential_id,
-        publicKey: Buffer.from(cred.data.public_key, 'base64'),
-        counter: Number(cred.data.counter),
+        id: cred.credential_id,
+        publicKey: Buffer.from(cred.public_key, 'base64'),
+        counter: Number(cred.counter),
         transports: ['internal', 'hybrid'],
       },
     });
     if (!verification.verified) return res.status(400).json({ error: 'Login verification failed' });
-    await supabase.from('notifications').update({ data: { ...cred.data, counter: verification.authenticationInfo.newCounter } }).eq('id', cred.id);
-    await supabase.from('notifications').delete().eq('type', 'webauthn_challenge').eq('user_id', userId).eq('data->>purpose', 'login');
+    const updated = creds.map(c => c.credential_id === cred.credential_id ? { ...c, counter: verification.authenticationInfo.newCounter } : c);
+    await storagePutJSON(credPath(userId), updated);
+    await storageDelete(chalPath(userId));
     // Issue a Supabase session for the verified user (service-role)
     const { data: sessionData, error: sessErr } = await supabase.auth.admin.signInWithId({ userId });
     if (sessErr || !sessionData?.session) {
@@ -2026,20 +2041,6 @@ app.delete('/api/affiliate/:id', requireAuth, async (req, res) => {
 });
 
 
-// TEMP storage probe
-app.post('/api/admin/_storage_test', requireAdmin, async (req, res) => {
-  if (!supabase) return res.status(500).json({ error: 'no supabase' });
-  try {
-    const { error: be } = await supabase.storage.createBucket('app-config', { public: false });
-    const { data: up, error: ue } = await supabase.storage.from('app-config').upload('probe.json', JSON.stringify({ ok: true }), { upsert: true, contentType: 'application/json' });
-    const { data: dl, error: de } = await supabase.storage.from('app-config').download('probe.json');
-    let txt = '';
-    if (dl) txt = await dl.text();
-    res.json({ bucketErr: be?.message || null, upload: up, uploadErr: ue?.message || null, downloadTxt: txt, dlErr: de?.message || null });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
 
 // ── Admin Analytics Endpoint ──────────────────────────────────
 app.get('/api/admin/analytics', requireAdmin, async (req, res) => {
@@ -4897,5 +4898,6 @@ app.listen(PORT, () => {
   console.log(`🚀 Omix API server running on port ${PORT}`);
   console.log(`   Paystack: ${PAYSTACK_SECRET?.startsWith('sk_live') ? 'PRODUCTION' : 'TEST'}`);
   console.log(`   Subaccount: ${OMIX_SUBACCOUNT_CODE || 'Not configured'}`);
+  ensureConfigBucket().catch(e => console.warn('[config] bucket ensure failed:', e.message));
 });
 // CRON_SECRET pick up marker
