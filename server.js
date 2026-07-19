@@ -2469,8 +2469,8 @@ app.post('/api/admin/apply-migrations', requireAdmin, async (req, res) => {
       for (const stmt of stmts) {
         const { error } = await supabase.rpc('exec_sql', { sql: stmt });
         if (error) {
-          console.error('[Migrate]', f, 'stmt failed:', error.message);
-          return res.status(500).json({ error: `Migration ${f} failed`, detail: error.message });
+          console.error('[Migrate]', f, 'stmt failed:', error.message, '|| STMT:', stmt.slice(0, 200));
+          return res.status(500).json({ error: `Migration ${f} failed`, detail: error.message, stmt: stmt.slice(0, 200) });
         }
       }
       applied.push(f);
