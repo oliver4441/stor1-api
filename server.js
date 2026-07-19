@@ -112,745 +112,6 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
   }
 }
 
-// ── Startup Migrations ──
-// Runs DDL migrations at startup using supabase.rpc('exec_sql', ...)
-// Requires the public.exec_sql() function to exist in the database.
-(async function runMigrations() {
-  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) return;
-
-  // Wait briefly for the Supabase client to initialize
-  await new Promise(r => setTimeout(r, 100));
-
-  async function runSql(description, query) {
-    if (!supabase) {
-      console.warn(`[Migration] ${description} skipped: supabase client not initialized`);
-      return false;
-    }
-    try {
-      const { error } = await supabase.rpc('exec_sql', { sql: query });
-      if (error) {
-        console.warn(`[Migration] ${description} failed: ${error.message}`);
-        return false;
-      }
-      console.log(`[Migration] ${description} OK`);
-      return true;
-    } catch (err) {
-      console.warn(`[Migration] ${description} error:`, err.message);
-      return false;
-    }
-  }
-
-  // M1: payment_method column
-  await runSql(
-    'payment_method column',
-    `ALTER TABLE omix_orders ADD COLUMN IF NOT EXISTS payment_method text DEFAULT 'pending';`
-  );
-
-  // M2: Affiliate system foundation
-  await runSql(
-    'affiliates table',
-    `CREATE TABLE IF NOT EXISTS public.affiliates (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
-      full_name TEXT NOT NULL,
-      email TEXT UNIQUE NOT NULL,
-      phone TEXT,
-      mpesa_number TEXT,
-      referral_code TEXT UNIQUE NOT NULL,
-      status TEXT DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
-      created_at TIMESTAMPTZ DEFAULT now(),
-      updated_at TIMESTAMPTZ DEFAULT now()
-    );`
-  );
-
-  await runSql(
-    'affiliate_logs table',
-    `CREATE TABLE IF NOT EXISTS public.affiliate_logs (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      affiliate_id UUID REFERENCES public.affiliates(id),
-      event_type TEXT NOT NULL,
-      details JSONB,
-      created_at TIMESTAMPTZ DEFAULT now()
-    );`
-  );
-
-  await runSql(
-    'profiles.referred_by column',
-    `ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS referred_by UUID REFERENCES public.affiliates(id);`
-  );
-
-  await runSql(
-    'affiliate indexes',
-    `CREATE INDEX IF NOT EXISTS idx_profiles_referred_by ON public.profiles(referred_by);
-     CREATE INDEX IF NOT EXISTS idx_affiliates_ref_code ON public.affiliates(referral_code);`
-  );
-
-  await runSql(
-    'updated_at trigger function',
-    `CREATE OR REPLACE FUNCTION public.update_modified_column()
-     RETURNS TRIGGER AS $$
-     BEGIN NEW.updated_at = now(); RETURN NEW; END;
-     $$ LANGUAGE plpgsql;`
-  );
-
-  await runSql(
-    'affiliates updated_at trigger',
-    `DROP TRIGGER IF EXISTS update_affiliates_modtime ON public.affiliates;
-     CREATE TRIGGER update_affiliates_modtime BEFORE UPDATE ON public.affiliates
-     FOR EACH ROW EXECUTE PROCEDURE public.update_modified_column();`
-  );
-
-  // M3: Monthly commissions & order details
-  await runSql(
-    'monthly_commissions table',
-    `CREATE TABLE IF NOT EXISTS public.monthly_commissions (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      affiliate_id UUID REFERENCES public.affiliates(id) ON DELETE CASCADE,
-      year INTEGER NOT NULL,
-      month INTEGER NOT NULL CHECK (month BETWEEN 1 AND 12),
-      total_sales DECIMAL(12, 2) DEFAULT 0,
-      qualified_order_count INTEGER DEFAULT 0,
-      commission_rate DECIMAL(4, 4) NOT NULL,
-      commission_amount DECIMAL(12, 2) DEFAULT 0,
-      status TEXT DEFAULT 'calculated' CHECK (status IN ('calculated', 'approved', 'paid', 'cancelled')),
-      approved_at TIMESTAMPTZ,
-      approved_by UUID REFERENCES auth.users(id),
-      paid_at TIMESTAMPTZ,
-      paystack_reference TEXT,
-      notes TEXT,
-      created_at TIMESTAMPTZ DEFAULT now(),
-      updated_at TIMESTAMPTZ DEFAULT now(),
-      UNIQUE(affiliate_id, year, month)
-    );`
-  );
-
-  await runSql(
-    'commission_order_details table',
-    `CREATE TABLE IF NOT EXISTS public.commission_order_details (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      commission_id UUID REFERENCES public.monthly_commissions(id) ON DELETE CASCADE,
-      order_id UUID REFERENCES public.omix_orders(id),
-      order_amount DECIMAL(12, 2) DEFAULT 0,
-      created_at TIMESTAMPTZ DEFAULT now()
-    );`
-  );
-
-  await runSql(
-    'commission indexes',
-    `CREATE INDEX IF NOT EXISTS idx_monthly_commissions_affiliate ON public.monthly_commissions(affiliate_id);
-     CREATE INDEX IF NOT EXISTS idx_monthly_commissions_status ON public.monthly_commissions(status);
-     CREATE INDEX IF NOT EXISTS idx_commission_order_details_commission ON public.commission_order_details(commission_id);`
-  );
-
-  await runSql(
-    'monthly_commissions updated_at trigger',
-    `DROP TRIGGER IF EXISTS update_monthly_commissions_modtime ON public.monthly_commissions;
-     CREATE TRIGGER update_monthly_commissions_modtime BEFORE UPDATE ON public.monthly_commissions
-     FOR EACH ROW EXECUTE PROCEDURE public.update_modified_column();`
-  );
-
-  // M4: Missing affiliate tables
-  await runSql(
-    'affiliate_tiers table',
-    `CREATE TABLE IF NOT EXISTS public.affiliate_tiers (
-      id SERIAL PRIMARY KEY,
-      name TEXT NOT NULL UNIQUE,
-      level INTEGER NOT NULL,
-      min_orders INTEGER NOT NULL DEFAULT 0,
-      min_sales DECIMAL(12,2) NOT NULL DEFAULT 0,
-      commission_rate DECIMAL(4,4) NOT NULL,
-      bonus_rate DECIMAL(4,4) NOT NULL DEFAULT 0,
-      description TEXT,
-      created_at TIMESTAMPTZ DEFAULT now()
-    );`
-  );
-
-  await runSql(
-    'affiliate_settings table',
-    `CREATE TABLE IF NOT EXISTS public.affiliate_settings (
-      key TEXT PRIMARY KEY,
-      value JSONB NOT NULL,
-      description TEXT,
-      updated_at TIMESTAMPTZ DEFAULT now()
-    );`
-  );
-
-  await runSql(
-    'referrals table',
-    `CREATE TABLE IF NOT EXISTS public.referrals (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      affiliate_id UUID REFERENCES public.affiliates(id) ON DELETE CASCADE,
-      referred_user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
-      referral_code TEXT NOT NULL,
-      status TEXT DEFAULT 'pending' CHECK (status IN ('pending','converted','expired')),
-      converted_at TIMESTAMPTZ,
-      first_order_id UUID,
-      created_at TIMESTAMPTZ DEFAULT now(),
-      UNIQUE(referred_user_id)
-    );`
-  );
-
-  await runSql(
-    'referral_clicks table',
-    `CREATE TABLE IF NOT EXISTS public.referral_clicks (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      affiliate_id UUID REFERENCES public.affiliates(id) ON DELETE CASCADE,
-      referral_code TEXT NOT NULL,
-      ip_address TEXT,
-      user_agent TEXT,
-      page_url TEXT,
-      converted BOOLEAN DEFAULT false,
-      created_at TIMESTAMPTZ DEFAULT now()
-    );`
-  );
-
-  await runSql(
-    'payout_requests table',
-    `CREATE TABLE IF NOT EXISTS public.payout_requests (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      affiliate_id UUID REFERENCES public.affiliates(id) ON DELETE CASCADE,
-      amount DECIMAL(12,2) NOT NULL,
-      mpesa_number TEXT NOT NULL,
-      mpesa_name TEXT,
-      status TEXT DEFAULT 'pending' CHECK (status IN ('pending','approved','paid','rejected')),
-      payable_after TIMESTAMPTZ,
-      processed_at TIMESTAMPTZ,
-      processed_by UUID REFERENCES auth.users(id),
-      admin_notes TEXT,
-      paystack_reference TEXT,
-      created_at TIMESTAMPTZ DEFAULT now()
-    );`
-  );
-
-  await runSql(
-    'referral & payout indexes',
-    `CREATE INDEX IF NOT EXISTS idx_referrals_affiliate ON public.referrals(affiliate_id);
-     CREATE INDEX IF NOT EXISTS idx_referrals_user ON public.referrals(referred_user_id);
-     CREATE INDEX IF NOT EXISTS idx_referrals_status ON public.referrals(status);
-     CREATE INDEX IF NOT EXISTS idx_referral_clicks_affiliate ON public.referral_clicks(affiliate_id);
-     CREATE INDEX IF NOT EXISTS idx_payout_requests_affiliate ON public.payout_requests(affiliate_id);
-     CREATE INDEX IF NOT EXISTS idx_payout_requests_status ON public.payout_requests(status);`
-  );
-
-  // M4.5: Fix missing referral_clicks columns (table was created without these)
-  // and reload PostgREST schema cache so new columns are visible
-  await runSql(
-    'referral_clicks missing columns',
-    `ALTER TABLE public.referral_clicks ADD COLUMN IF NOT EXISTS converted BOOLEAN DEFAULT false;
-     ALTER TABLE public.referral_clicks ADD COLUMN IF NOT EXISTS ip_address TEXT;
-     ALTER TABLE public.referral_clicks ADD COLUMN IF NOT EXISTS page_url TEXT;
-     ALTER TABLE public.referral_clicks ADD COLUMN IF NOT EXISTS referral_code TEXT;
-     ALTER TABLE public.referral_clicks ADD COLUMN IF NOT EXISTS user_agent TEXT;
-     NOTIFY pgrst, 'reload schema';`
-  );
-
-  await runSql(
-    'seed affiliate tiers (spec alignment)',
-    `DELETE FROM public.affiliate_tiers;
-     INSERT INTO public.affiliate_tiers (name, level, min_orders, min_sales, commission_rate, bonus_rate, description)
-     VALUES
-       ('Silver', 1, 0, 0, 0.0500, 0, '0-29 qualified sales - 5% commission'),
-       ('Gold', 2, 30, 0, 0.1000, 0, '30+ qualified sales - 10% commission (maximum)')
-     ON CONFLICT (name) DO NOTHING;`
-  );
-
-  await runSql(
-    'seed affiliate settings (spec alignment)',
-    `DELETE FROM public.affiliate_settings WHERE key IN ('attribution_model', 'cookie_expiry_days', 'referral_reward_type', 'referral_reward_value');
-     INSERT INTO public.affiliate_settings (key, value, description)
-     VALUES
-       ('min_payout', '"2000"', 'Minimum payout threshold in KES'),
-       ('commission_period', '"monthly"', 'Commission calculation period'),
-       ('attribution_model', '"first_touch"', 'First attribution always wins — never overwritten'),
-       ('cookie_expiry_days', '"36525"', 'Permanent cookie (100 years) — spec says never expires'),
-       ('cookie_consent_required', '"false"', 'Cookie consent not required for affiliate tracking'),
-       ('mpesa_b2c_active', '"true"', 'M-Pesa B2C payouts active'),
-       ('tier_upgrade_frequency', '"yearly"', 'Tiers recalculated yearly per spec'),
-       ('max_payout_attempts', '"3"', 'Maximum payout retry attempts'),
-       ('auto_calculate_enabled', '"true"', 'Auto-calculate commissions on schedule'),
-       ('referral_cookie_name', '"omix_ref"', 'Cookie name for referral tracking')
-     ON CONFLICT (key) DO NOTHING;`
-  );
-
-  await runSql(
-    'calculate_affiliate_tier function',
-    `CREATE OR REPLACE FUNCTION public.calculate_affiliate_tier(p_affiliate_id UUID)
-     RETURNS INTEGER AS $func$
-     DECLARE
-       v_total_orders INTEGER;
-       v_total_sales DECIMAL(12,2);
-       v_tier_id INTEGER;
-     BEGIN
-       SELECT COUNT(DISTINCT o.id), COALESCE(SUM(o.total_amount), 0)
-       INTO v_total_orders, v_total_sales
-       FROM public.referrals r
-       JOIN public.omix_orders o ON o.user_id = r.referred_user_id AND o.status IN ('paid','completed','delivered')
-       WHERE r.affiliate_id = p_affiliate_id;
-       SELECT id INTO v_tier_id FROM public.affiliate_tiers
-       WHERE v_total_orders >= min_orders AND v_total_sales >= min_sales
-       ORDER BY level DESC LIMIT 1;
-       RETURN COALESCE(v_tier_id, (SELECT id FROM public.affiliate_tiers WHERE level = 1));
-     END;
-     $func$ LANGUAGE plpgsql;`
-  );
-
-  await runSql(
-    'calculate_monthly_commission function',
-    `CREATE OR REPLACE FUNCTION public.calculate_monthly_commission(
-       p_affiliate_id UUID, p_year INTEGER, p_month INTEGER
-     )
-     RETURNS UUID AS $func$
-     DECLARE
-       v_tier_id INTEGER;
-       v_rate DECIMAL(4,4);
-       v_bonus_rate DECIMAL(4,4);
-       v_user_ids UUID[];
-       v_total_sales DECIMAL(12,2);
-       v_order_count INTEGER;
-       v_commission_amount DECIMAL(12,2);
-       v_commission_id UUID;
-     BEGIN
-       v_tier_id := public.calculate_affiliate_tier(p_affiliate_id);
-       SELECT commission_rate, bonus_rate INTO v_rate, v_bonus_rate
-       FROM public.affiliate_tiers WHERE id = v_tier_id;
-       SELECT array_agg(referred_user_id) INTO v_user_ids
-       FROM public.referrals
-       WHERE affiliate_id = p_affiliate_id AND status = 'converted';
-       IF v_user_ids IS NULL OR array_length(v_user_ids, 1) = 0 THEN
-         RETURN NULL;
-       END IF;
-       SELECT COALESCE(SUM(o.total_amount), 0), COUNT(DISTINCT o.id)
-       INTO v_total_sales, v_order_count
-       FROM public.omix_orders o
-       WHERE o.user_id = ANY(v_user_ids)
-         AND o.status IN ('paid','completed','delivered')
-         AND o.created_at >= make_date(p_year, p_month, 1)
-         AND o.created_at < make_date(p_year, p_month, 1) + interval '1 month';
-       IF v_order_count = 0 THEN RETURN NULL; END IF;
-       v_commission_amount := v_total_sales * (v_rate + v_bonus_rate);
-       INSERT INTO public.monthly_commissions
-         (affiliate_id, year, month, total_sales, qualified_order_count, commission_rate, commission_amount, status)
-       VALUES
-         (p_affiliate_id, p_year, p_month, v_total_sales, v_order_count, v_rate + v_bonus_rate, v_commission_amount, 'calculated')
-       ON CONFLICT (affiliate_id, year, month)
-       DO UPDATE SET
-         total_sales = EXCLUDED.total_sales,
-         qualified_order_count = EXCLUDED.qualified_order_count,
-         commission_rate = EXCLUDED.commission_rate,
-         commission_amount = EXCLUDED.commission_amount,
-         status = 'calculated'
-       RETURNING id INTO v_commission_id;
-       DELETE FROM public.commission_order_details WHERE commission_id = v_commission_id;
-       INSERT INTO public.commission_order_details (commission_id, order_id, order_amount)
-       SELECT v_commission_id, o.id, o.total_amount
-       FROM public.omix_orders o
-       WHERE o.user_id = ANY(v_user_ids)
-         AND o.status IN ('paid','completed','delivered')
-         AND o.created_at >= make_date(p_year, p_month, 1)
-         AND o.created_at < make_date(p_year, p_month, 1) + interval '1 month';
-       RETURN v_commission_id;
-     END;
-     $func$ LANGUAGE plpgsql;`
-  );
-
-  // Auto-convert referral on qualifying order
-  await runSql(
-    'referral conversion trigger',
-    `CREATE OR REPLACE FUNCTION public.convert_referral_on_order()
-     RETURNS TRIGGER AS $func$
-     BEGIN
-       IF NEW.status IN ('paid','completed','delivered') THEN
-         UPDATE public.referrals
-         SET status = 'converted',
-             converted_at = COALESCE(NEW.paid_at, NOW()),
-             first_order_id = CASE WHEN first_order_id IS NULL THEN NEW.id ELSE first_order_id END
-         WHERE referred_user_id = NEW.user_id
-           AND status = 'pending'
-           AND first_order_id IS NULL;
-       END IF;
-       RETURN NEW;
-     END;
-     $func$ LANGUAGE plpgsql SECURITY DEFINER;
-     DROP TRIGGER IF EXISTS trg_convert_referral_on_order ON public.omix_orders;
-     CREATE TRIGGER trg_convert_referral_on_order
-       AFTER INSERT OR UPDATE OF status ON public.omix_orders
-       FOR EACH ROW
-       EXECUTE FUNCTION public.convert_referral_on_order();`
-  );
-
-  // M5: Self-signup support — allow 'pending' status for affiliate self-application
-  await runSql(
-    'M5: affiliates status + pending columns',
-    `ALTER TABLE public.affiliates DROP CONSTRAINT IF EXISTS affiliates_status_check;
-     ALTER TABLE public.affiliates ADD CONSTRAINT affiliates_status_check CHECK (status IN ('active', 'inactive'));
-     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ;
-     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS approved_by UUID REFERENCES auth.users(id) ON DELETE SET NULL;
-     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS notes TEXT;`
-  );
-
-  // M6: Spec alignment — commission lifecycle, yearly tiers, payout columns
-  await runSql(
-    'M6: monthly_commissions status lifecycle',
-    `ALTER TABLE public.monthly_commissions DROP CONSTRAINT IF EXISTS monthly_commissions_status_check;
-     ALTER TABLE public.monthly_commissions ADD CONSTRAINT monthly_commissions_status_check
-       CHECK (status IN ('pending', 'calculated', 'approved', 'paid', 'cancelled'));`
-  );
-
-  await runSql(
-    'M6: yearly tier calculation function',
-    `CREATE OR REPLACE FUNCTION public.calculate_affiliate_tier(p_affiliate_id UUID)
-     RETURNS INTEGER AS $func$
-     DECLARE
-       v_total_orders INTEGER;
-       v_current_year INTEGER := EXTRACT(YEAR FROM NOW());
-       v_tier_id INTEGER;
-     BEGIN
-       SELECT COUNT(DISTINCT o.id)
-       INTO v_total_orders
-       FROM public.referrals r
-       JOIN public.omix_orders o ON o.user_id = r.referred_user_id AND o.status IN ('paid','completed','delivered')
-       WHERE r.affiliate_id = p_affiliate_id
-         AND EXTRACT(YEAR FROM o.created_at) = v_current_year;
-       SELECT id INTO v_tier_id FROM public.affiliate_tiers
-       WHERE v_total_orders >= min_orders
-       ORDER BY level DESC LIMIT 1;
-       RETURN COALESCE(v_tier_id, (SELECT id FROM public.affiliate_tiers WHERE level = 1));
-     END;
-     $func$ LANGUAGE plpgsql;`
-  );
-
-  await runSql(
-    'M6: payout_requests approved_at/approved_by columns',
-    `ALTER TABLE public.payout_requests ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ;
-     ALTER TABLE public.payout_requests ADD COLUMN IF NOT EXISTS approved_by UUID REFERENCES auth.users(id) ON DELETE SET NULL;`
-  );
-
-  // M7: Self-apply support — allow pending/revoked status + application form columns
-  await runSql(
-    'M7: affiliates status constraint update',
-    `ALTER TABLE public.affiliates DROP CONSTRAINT IF EXISTS affiliates_status_check;
-     ALTER TABLE public.affiliates ADD CONSTRAINT affiliates_status_check
-       CHECK (status IN ('pending', 'active', 'inactive', 'revoked', 'terminated'));`
-  );
-
-  await runSql(
-    'M7: affiliates application columns',
-    `ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS alternative_phone TEXT;
-     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS physical_address TEXT;
-     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS id_number TEXT;
-     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS date_of_birth DATE;
-     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS mpesa_account_name TEXT;
-     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS promotional_methods JSONB DEFAULT '[]'::jsonb;
-     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS social_media_handles TEXT;
-     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS how_heard TEXT;
-     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS tier TEXT DEFAULT 'bronze';
-     ALTER TABLE public.affiliates ADD COLUMN IF NOT EXISTS tier_achieved_at TIMESTAMPTZ;`
-  );
-
-  // M8: All new e-commerce features (delivery zones, pickup stations, Q&A, wholesale, sellers, returns, rating cache)
-
-  // Pre-M8: Deduplicate pickup_stations before adding unique constraint
-  // Must first re-link any orders referencing duplicate stations, then delete, then add constraint
-  await runSql(
-    'M8-pre: deduplicate pickup_stations',
-    `WITH keep_ids AS (
-       SELECT MIN(id) AS id, name, area
-       FROM public.pickup_stations
-       GROUP BY name, area
-     ),
-     delete_ids AS (
-       SELECT p.id FROM public.pickup_stations p
-       WHERE NOT EXISTS (SELECT 1 FROM keep_ids k WHERE k.id = p.id)
-     )
-     UPDATE public.omix_orders o
-     SET pickup_station_id = k.id
-     FROM keep_ids k, delete_ids d, public.pickup_stations ps
-     WHERE o.pickup_station_id = d.id
-       AND ps.id = o.pickup_station_id
-       AND ps.name = k.name AND ps.area = k.area;
-
-     DELETE FROM public.pickup_stations p
-     WHERE EXISTS (SELECT 1 FROM delete_ids d WHERE d.id = p.id);`
-  );
-
-  await runSql(
-    'M8: delivery_zones table',
-    `CREATE TABLE IF NOT EXISTS public.delivery_zones (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      zone_name TEXT NOT NULL UNIQUE,
-      display_name TEXT NOT NULL,
-      estimated_days_min INTEGER NOT NULL DEFAULT 1,
-      estimated_days_max INTEGER NOT NULL DEFAULT 3,
-      delivery_fee DECIMAL(10, 2) NOT NULL DEFAULT 0,
-      free_delivery_threshold DECIMAL(10, 2) DEFAULT NULL,
-      is_active BOOLEAN DEFAULT true,
-      sort_order INTEGER DEFAULT 0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    INSERT INTO public.delivery_zones (zone_name, display_name, estimated_days_min, estimated_days_max, delivery_fee, free_delivery_threshold, sort_order) VALUES
-      ('kericho_cbd', 'Kericho CBD', 0, 0, 0, NULL, 1),
-      ('kericho_town', 'Kericho Town', 1, 2, 0, NULL, 2),
-      ('kericho_surrounding', 'Kericho Surrounding', 1, 2, 0, 2000, 3),
-      ('litein', 'Litein', 1, 2, 0, 2000, 4),
-      ('kipkelion', 'Kipkelion', 2, 3, 150, 2500, 5),
-      ('londiani', 'Londiani', 2, 3, 150, 2500, 6),
-      ('brooke', 'Brooke', 2, 3, 150, 2500, 7),
-      ('sosiot', 'Sosiot', 2, 3, 150, 2500, 8),
-      ('outside_kericho', 'Outside Kericho', 3, 5, 300, 5000, 9)
-    ON CONFLICT (zone_name) DO NOTHING;
-    ALTER TABLE public.delivery_zones ENABLE ROW LEVEL SECURITY;
-    DROP POLICY IF EXISTS "Anyone can view delivery zones" ON public.delivery_zones;
-    CREATE POLICY "Anyone can view delivery zones" ON public.delivery_zones FOR SELECT USING (true);`
-  );
-
-  await runSql(
-    'M8: delivery zone/station columns on orders',
-    `ALTER TABLE public.omix_orders ADD COLUMN IF NOT EXISTS delivery_zone_id UUID REFERENCES public.delivery_zones(id);
-     ALTER TABLE public.omix_orders ADD COLUMN IF NOT EXISTS delivery_estimate_min INTEGER DEFAULT NULL;
-     ALTER TABLE public.omix_orders ADD COLUMN IF NOT EXISTS delivery_estimate_max INTEGER DEFAULT NULL;
-     ALTER TABLE public.omix_orders ADD COLUMN IF NOT EXISTS pickup_station_id UUID REFERENCES public.pickup_stations(id);
-     ALTER TABLE public.omix_orders ADD COLUMN IF NOT EXISTS delivery_type TEXT DEFAULT 'delivery' CHECK (delivery_type IN ('delivery', 'pickup'));
-     ALTER TABLE public.omix_orders ADD COLUMN IF NOT EXISTS delivery_fee DECIMAL(10, 2) DEFAULT 0;`
-  );
-
-  await runSql(
-    'M8: pickup_stations table',
-    `CREATE TABLE IF NOT EXISTS public.pickup_stations (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      name TEXT NOT NULL,
-      area TEXT NOT NULL,
-      address TEXT, landmark TEXT,
-      latitude DECIMAL(10, 7) DEFAULT NULL, longitude DECIMAL(10, 7) DEFAULT NULL,
-      operating_hours TEXT DEFAULT 'Mon-Sat 8AM-6PM',
-      contact_phone TEXT DEFAULT NULL,
-      is_active BOOLEAN DEFAULT true,
-      sort_order INTEGER DEFAULT 0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    ALTER TABLE public.pickup_stations DROP CONSTRAINT IF EXISTS pickup_stations_name_area_key;
-    ALTER TABLE public.pickup_stations ADD CONSTRAINT pickup_stations_name_area_key UNIQUE (name, area);
-    INSERT INTO public.pickup_stations (name, area, address, landmark, latitude, longitude, operating_hours, contact_phone, sort_order) VALUES
-      ('Omix Store - CBD', 'Kericho CBD', 'Kericho Town, Opposite Post Bank', 'Next to Kericho Post Office', -0.3689, 35.2839, 'Mon-Sat 8AM-7PM, Sun 9AM-4PM', '254746674392', 1),
-      ('Omix Store - Litein', 'Litein', 'Litein Shopping Centre', 'Opposite Litein Market', -0.5833, 35.2000, 'Mon-Sat 8AM-6PM', '254722123456', 2),
-      ('Omix Store - Brooke', 'Brooke', 'Brooke Market Area', 'Near Brooke Tea Factory', -0.3667, 35.2833, 'Mon-Sat 8AM-6PM', '254723123456', 3),
-      ('Omix Store - Sosiot', 'Sosiot', 'Sosiot Town Centre', 'Next to Sosiot Stage', -0.4833, 35.2167, 'Mon-Sat 8AM-6PM', '254733123456', 4),
-      ('Omix Store - Kipkelion', 'Kipkelion', 'Kipkelion Town', 'Near Kipkelion Market', -0.2000, 35.4667, 'Mon-Sat 8AM-6PM', '254740123456', 5),
-      ('Omix Store - Kericho Tea Estate', 'Kericho Tea Estate', 'Tea Estate Shopping Complex, Opposite Kericho Golf Club', 'Near Kericho Golf Club', -0.3655, 35.2870, 'Mon-Sat 8AM-6:30PM, Sun 9AM-3PM', '254746674392', 6),
-      ('Omix Store - Kapkatet', 'Kapkatet', 'Kapkatet Market Area, Near Kapkatet Dispensary', 'Opposite Kapkatet Dispensary', -0.4333, 35.1500, 'Mon-Sat 8AM-5:30PM', '254755123456', 7)
-    ON CONFLICT (name, area) DO NOTHING;
-    ALTER TABLE public.pickup_stations ENABLE ROW LEVEL SECURITY;
-    DROP POLICY IF EXISTS "Anyone can view pickup stations" ON public.pickup_stations;
-    CREATE POLICY "Anyone can view pickup stations" ON public.pickup_stations FOR SELECT USING (true);`
-  );
-
-  await runSql(
-    'M8: product_questions table',
-    `CREATE TABLE IF NOT EXISTS public.product_questions (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      listing_id UUID NOT NULL REFERENCES public.listings(id) ON DELETE CASCADE,
-      user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-      user_name TEXT NOT NULL,
-      question TEXT NOT NULL,
-      answer TEXT DEFAULT NULL,
-      answered_by UUID REFERENCES auth.users(id) ON DELETE SET NULL,
-      answered_at TIMESTAMPTZ DEFAULT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    ALTER TABLE public.product_questions ENABLE ROW LEVEL SECURITY;
-    DROP POLICY IF EXISTS "Anyone can view product questions" ON public.product_questions;
-    CREATE POLICY "Anyone can view product questions" ON public.product_questions FOR SELECT USING (true);
-    DROP POLICY IF EXISTS "Users can insert own questions" ON public.product_questions;
-    CREATE POLICY "Users can insert own questions" ON public.product_questions FOR INSERT WITH CHECK (auth.uid() = user_id);
-    DROP POLICY IF EXISTS "Admins can answer questions" ON public.product_questions;
-    CREATE POLICY "Admins can answer questions" ON public.product_questions FOR UPDATE USING (EXISTS (SELECT 1 FROM public.profiles WHERE id = auth.uid() AND role = 'admin'));
-    CREATE INDEX IF NOT EXISTS idx_product_questions_listing_id ON public.product_questions(listing_id);`
-  );
-
-  await runSql(
-    'M8: wholesale_prices table + listing wholesale columns',
-    `CREATE TABLE IF NOT EXISTS public.wholesale_prices (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      listing_id UUID NOT NULL REFERENCES public.listings(id) ON DELETE CASCADE,
-      min_quantity INTEGER NOT NULL CHECK (min_quantity > 0),
-      max_quantity INTEGER DEFAULT NULL,
-      unit_price DECIMAL(10, 2) NOT NULL CHECK (unit_price > 0),
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      CONSTRAINT unique_listing_tier UNIQUE (listing_id, min_quantity)
-    );
-    ALTER TABLE public.wholesale_prices ENABLE ROW LEVEL SECURITY;
-    DROP POLICY IF EXISTS "Anyone can view wholesale prices" ON public.wholesale_prices;
-    CREATE POLICY "Anyone can view wholesale prices" ON public.wholesale_prices FOR SELECT USING (true);
-    ALTER TABLE public.listings ADD COLUMN IF NOT EXISTS wholesale_enabled BOOLEAN DEFAULT false;
-    ALTER TABLE public.listings ADD COLUMN IF NOT EXISTS wholesale_min_qty INTEGER DEFAULT NULL;`
-  );
-
-  await runSql(
-    'M8: sellers table',
-    `CREATE TABLE IF NOT EXISTS public.sellers (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE UNIQUE,
-      shop_name TEXT NOT NULL,
-      shop_slug TEXT UNIQUE NOT NULL,
-      shop_description TEXT, shop_logo TEXT, shop_banner TEXT,
-      phone TEXT, email TEXT, address TEXT,
-      business_registration TEXT,
-      commission_rate DECIMAL(4, 4) DEFAULT 0.0500,
-      total_sales DECIMAL(12, 2) DEFAULT 0,
-      total_orders INTEGER DEFAULT 0,
-      rating DECIMAL(3, 2) DEFAULT 0,
-      seller_score DECIMAL(4, 1) DEFAULT 100.0,
-      is_verified BOOLEAN DEFAULT false,
-      is_active BOOLEAN DEFAULT true,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    ALTER TABLE public.sellers ENABLE ROW LEVEL SECURITY;
-    DROP POLICY IF EXISTS "Anyone can view sellers" ON public.sellers;
-    CREATE POLICY "Anyone can view sellers" ON public.sellers FOR SELECT USING (true);
-    DROP POLICY IF EXISTS "Users can register as seller" ON public.sellers;
-    CREATE POLICY "Users can register as seller" ON public.sellers FOR INSERT WITH CHECK (auth.uid() = user_id);
-    DROP POLICY IF EXISTS "Sellers can update own profile" ON public.sellers;
-    CREATE POLICY "Sellers can update own profile" ON public.sellers FOR UPDATE USING (auth.uid() = user_id);
-    ALTER TABLE public.listings ADD COLUMN IF NOT EXISTS seller_id UUID REFERENCES public.sellers(id);
-    ALTER TABLE public.omix_orders ADD COLUMN IF NOT EXISTS seller_id UUID REFERENCES public.sellers(id);`
-  );
-
-  await runSql(
-    'M8: seller_payouts table',
-    `CREATE TABLE IF NOT EXISTS public.seller_payouts (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      seller_id UUID NOT NULL REFERENCES public.sellers(id) ON DELETE CASCADE,
-      amount DECIMAL(12, 2) NOT NULL,
-      status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'paid', 'cancelled')),
-      period_start DATE NOT NULL, period_end DATE NOT NULL,
-      paid_at TIMESTAMPTZ DEFAULT NULL, notes TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    ALTER TABLE public.seller_payouts ENABLE ROW LEVEL SECURITY;
-    DROP POLICY IF EXISTS "Sellers can view own payouts" ON public.seller_payouts;
-    CREATE POLICY "Sellers can view own payouts" ON public.seller_payouts FOR SELECT
-      USING (EXISTS (SELECT 1 FROM public.sellers WHERE id = seller_payouts.seller_id AND user_id = auth.uid()));`
-  );
-
-  await runSql(
-    'M8: return_requests table',
-    `CREATE TABLE IF NOT EXISTS public.return_requests (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      order_id UUID NOT NULL REFERENCES public.omix_orders(id) ON DELETE CASCADE,
-      order_item_id UUID REFERENCES public.omix_order_items(id),
-      user_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
-      reason TEXT NOT NULL,
-      status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'collected', 'refunded', 'rejected')),
-      refund_amount DECIMAL(12, 2) DEFAULT NULL,
-      notes TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    ALTER TABLE public.return_requests ENABLE ROW LEVEL SECURITY;
-    DROP POLICY IF EXISTS "Users can view own returns" ON public.return_requests;
-    CREATE POLICY "Users can view own returns" ON public.return_requests FOR SELECT
-      USING (auth.uid() = user_id OR EXISTS (SELECT 1 FROM public.profiles WHERE id = auth.uid() AND role = 'admin'));
-    DROP POLICY IF EXISTS "Users can create return requests" ON public.return_requests;
-    CREATE POLICY "Users can create return requests" ON public.return_requests FOR INSERT WITH CHECK (auth.uid() = user_id);
-    CREATE INDEX IF NOT EXISTS idx_return_requests_order_id ON public.return_requests(order_id);`
-  );
-
-  await runSql(
-    'M8: rating cache columns + trigger',
-    `ALTER TABLE public.listings ADD COLUMN IF NOT EXISTS avg_rating DECIMAL(3, 2) DEFAULT NULL;
-     ALTER TABLE public.listings ADD COLUMN IF NOT EXISTS review_count INTEGER DEFAULT 0;
-     CREATE OR REPLACE FUNCTION public.update_listing_rating()
-     RETURNS TRIGGER AS $$
-     BEGIN
-       UPDATE public.listings
-       SET avg_rating = (SELECT ROUND(AVG(rating::decimal), 2) FROM public.product_reviews WHERE listing_id = COALESCE(NEW.listing_id, OLD.listing_id)),
-           review_count = (SELECT COUNT(*) FROM public.product_reviews WHERE listing_id = COALESCE(NEW.listing_id, OLD.listing_id))
-       WHERE id = COALESCE(NEW.listing_id, OLD.listing_id);
-       RETURN NULL;
-     END;
-     $$ LANGUAGE plpgsql SECURITY DEFINER;
-     DROP TRIGGER IF EXISTS trg_update_listing_rating_insert ON public.product_reviews;
-     CREATE TRIGGER trg_update_listing_rating_insert AFTER INSERT ON public.product_reviews FOR EACH ROW EXECUTE FUNCTION public.update_listing_rating();
-     DROP TRIGGER IF EXISTS trg_update_listing_rating_update ON public.product_reviews;
-     CREATE TRIGGER trg_update_listing_rating_update AFTER UPDATE OF rating ON public.product_reviews FOR EACH ROW EXECUTE FUNCTION public.update_listing_rating();
-     DROP TRIGGER IF EXISTS trg_update_listing_rating_delete ON public.product_reviews;
-     CREATE TRIGGER trg_update_listing_rating_delete AFTER DELETE ON public.product_reviews FOR EACH ROW EXECUTE FUNCTION public.update_listing_rating();
-     UPDATE public.listings l SET avg_rating = (SELECT ROUND(AVG(rating::decimal), 2) FROM public.product_reviews WHERE listing_id = l.id),
-       review_count = (SELECT COUNT(*) FROM public.product_reviews WHERE listing_id = l.id);`
-  );
-
-  await runSql(
-    'M8: search indexes',
-    `CREATE INDEX IF NOT EXISTS idx_listings_avg_rating ON public.listings(avg_rating);
-     CREATE INDEX IF NOT EXISTS idx_listings_wholesale ON public.listings(wholesale_enabled) WHERE wholesale_enabled = true;
-     CREATE INDEX IF NOT EXISTS idx_omix_orders_delivery_type ON public.omix_orders(delivery_type);`
-  );
-
-  await runSql(
-    'M8: grant permissions',
-    `GRANT ALL ON public.delivery_zones TO anon, authenticated, service_role;
-     GRANT ALL ON public.pickup_stations TO anon, authenticated, service_role;
-     GRANT ALL ON public.product_questions TO anon, authenticated, service_role;
-     GRANT ALL ON public.wholesale_prices TO anon, authenticated, service_role;
-     GRANT ALL ON public.sellers TO anon, authenticated, service_role;
-     GRANT ALL ON public.seller_payouts TO anon, authenticated, service_role;
-     GRANT ALL ON public.return_requests TO anon, authenticated, service_role;`
-  );
-
-  // M9: Seller approval flow — status column + review metadata
-  await runSql(
-    'M9: seller status + rejection_reason + reviewed_by + reviewed_at',
-    `ALTER TABLE public.sellers ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected','suspended'));
-     ALTER TABLE public.sellers ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
-     ALTER TABLE public.sellers ADD COLUMN IF NOT EXISTS reviewed_by UUID REFERENCES auth.users(id) ON DELETE SET NULL;
-     ALTER TABLE public.sellers ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;`
-  );
-
-  // M10: Enhanced product & order data model
-  await runSql(
-    'M10: listings — warranty, return policy, shipping dimensions, tags',
-    `ALTER TABLE public.listings ADD COLUMN IF NOT EXISTS warranty_period TEXT;
-     ALTER TABLE public.listings ADD COLUMN IF NOT EXISTS return_policy TEXT;
-     ALTER TABLE public.listings ADD COLUMN IF NOT EXISTS shipping_dimensions JSONB DEFAULT NULL;
-     ALTER TABLE public.listings ADD COLUMN IF NOT EXISTS tags TEXT[] DEFAULT '{}';`
-  );
-
-  await runSql(
-    'M10: omix_orders — street, delivery_instructions, alternate_phone, order_notes, scheduled_date, id_number',
-    `ALTER TABLE public.omix_orders ADD COLUMN IF NOT EXISTS street TEXT DEFAULT NULL;
-     ALTER TABLE public.omix_orders ADD COLUMN IF NOT EXISTS delivery_instructions TEXT DEFAULT NULL;
-     ALTER TABLE public.omix_orders ADD COLUMN IF NOT EXISTS alternate_phone TEXT DEFAULT NULL;
-     ALTER TABLE public.omix_orders ADD COLUMN IF NOT EXISTS order_notes TEXT DEFAULT NULL;
-     ALTER TABLE public.omix_orders ADD COLUMN IF NOT EXISTS scheduled_date DATE DEFAULT NULL;
-     ALTER TABLE public.omix_orders ADD COLUMN IF NOT EXISTS id_number TEXT DEFAULT NULL;`
-  );
-
-  await runSql(
-    'M10: omix_order_items — variant columns, seller_id, listing_snapshot',
-    `ALTER TABLE public.omix_order_items ADD COLUMN IF NOT EXISTS variant_size TEXT DEFAULT NULL;
-     ALTER TABLE public.omix_order_items ADD COLUMN IF NOT EXISTS variant_color TEXT DEFAULT NULL;
-     ALTER TABLE public.omix_order_items ADD COLUMN IF NOT EXISTS variant_label TEXT DEFAULT NULL;
-     ALTER TABLE public.omix_order_items ADD COLUMN IF NOT EXISTS seller_id UUID REFERENCES public.sellers(id) ON DELETE SET NULL;
-     ALTER TABLE public.omix_order_items ADD COLUMN IF NOT EXISTS listing_snapshot JSONB DEFAULT NULL;`
-  );
-
-  await runSql(
-    'M10: omix_orders index on new fields',
-    `CREATE INDEX IF NOT EXISTS idx_omix_orders_scheduled_date ON public.omix_orders(scheduled_date);
-     CREATE INDEX IF NOT EXISTS idx_omix_order_items_seller_id ON public.omix_order_items(seller_id);`
-  );
-
-  // M11: Missing columns for search filters (safe IF NOT EXISTS, independent of M8 trigger batch)
-  await runSql(
-    'M11: ensure search filter columns exist',
-    `ALTER TABLE public.listings ADD COLUMN IF NOT EXISTS avg_rating DECIMAL(3, 2) DEFAULT NULL;
-     ALTER TABLE public.listings ADD COLUMN IF NOT EXISTS review_count INTEGER DEFAULT 0;
-     ALTER TABLE public.listings ADD COLUMN IF NOT EXISTS compare_at_price DECIMAL(12, 2) DEFAULT NULL;
-     CREATE INDEX IF NOT EXISTS idx_listings_avg_rating ON public.listings(avg_rating);
-     CREATE INDEX IF NOT EXISTS idx_listings_compare_at_price ON public.listings(compare_at_price) WHERE compare_at_price IS NOT NULL;`
-  );
-
-  console.log('[Migration] All startup migrations completed');
-})();
 
 if (!PAYSTACK_SECRET) {
   console.warn('PAYSTACK_SECRET_KEY not set — Paystack routes will return 503');
@@ -2438,58 +1699,16 @@ app.delete('/api/admin/users/:id', requireAdmin, async (req, res) => {
   }
 });
 
-// ── Admin: Apply pending DB migrations (idempotent, admin-only) ──
-app.post('/api/admin/apply-migrations', requireAdmin, async (req, res) => {
-  try {
-    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
-    const fs = await import('fs');
-    const path = await import('path');
-    const migDir = path.default.join(process.cwd(), 'supabase', 'migrations');
-    const files = fs.default.readdirSync(migDir).filter(f => f.endsWith('.sql')).sort()
-      .filter(f => f.startsWith('20260719') || f.includes('webauthn') || f.includes('broadcast'));
-    // Split SQL into individual statements and run via the project's exec_sql RPC (per-statement, like create_participants_table.cjs)
-    function splitStatements(sql) {
-      const out = [];
-      let cur = '', inString = false, ch;
-      for (let i = 0; i < sql.length; i++) {
-        ch = sql[i];
-        if (ch === "'") inString = !inString;
-        if (ch === ';' && !inString) {
-          if (cur.trim()) out.push(cur.trim());
-          cur = '';
-        } else cur += ch;
-      }
-      if (cur.trim()) out.push(cur.trim());
-      return out.filter(s => s && !s.startsWith('--'));
-    }
-    const applied = [];
-    for (const f of files) {
-      const sqlText = fs.default.readFileSync(path.default.join(migDir, f), 'utf8');
-      const stmts = splitStatements(sqlText);
-      for (const stmt of stmts) {
-        const { error } = await supabase.rpc('exec_sql', { sql: stmt });
-        if (error) {
-          console.error('[Migrate]', f, 'stmt failed:', error.message, '|| STMT:', stmt.slice(0, 200));
-          return res.status(500).json({ error: `Migration ${f} failed`, detail: error.message, stmt: stmt.slice(0, 200) });
-        }
-        await new Promise(r => setTimeout(r, 250));
-      }
-      applied.push(f);
-    }
-    res.json({ success: true, applied });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
 // ── Admin: Get/Update broadcast settings (master toggle + default channels) ──
+// Stored as a single row in `notifications` with type='broadcast_settings' (avoids needing a new table)
 app.get('/api/admin/broadcast/settings', requireAdmin, async (req, res) => {
   try {
     if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
-    const { data } = await supabase.from('site_settings').select('value').eq('key', 'broadcast').single();
-    res.json({ success: true, settings: data?.value || { enabled: true, default_email: true, default_push: true } });
+    const { data } = await supabase.from('notifications').select('data').eq('type', 'broadcast_settings').single();
+    res.json({ success: true, settings: data?.data || { enabled: true, default_email: true, default_push: true } });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.json({ success: true, settings: { enabled: true, default_email: true, default_push: true } });
   }
 });
 
@@ -2502,7 +1721,12 @@ app.put('/api/admin/broadcast/settings', requireAdmin, async (req, res) => {
       default_email: default_email !== undefined ? !!default_email : true,
       default_push: default_push !== undefined ? !!default_push : true,
     };
-    await supabase.from('site_settings').upsert({ key: 'broadcast', value: settings, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+    const { data: existing } = await supabase.from('notifications').select('id').eq('type', 'broadcast_settings').single();
+    if (existing) {
+      await supabase.from('notifications').update({ data: settings, updated_at: new Date().toISOString() }).eq('id', existing.id);
+    } else {
+      await supabase.from('notifications').insert({ type: 'broadcast_settings', title: 'Broadcast settings', data: settings, created_at: new Date().toISOString() });
+    }
     res.json({ success: true, settings });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2518,11 +1742,16 @@ app.get('/api/webauthn/credentials', requireAuth, async (req, res) => {
   try {
     if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
     const { data } = await supabase
-      .from('webauthn_credentials')
-      .select('id, device_name, created_at')
-      .eq('user_id', req.user.id)
-      .order('created_at', { ascending: false });
-    res.json({ success: true, credentials: data || [] });
+      .from('notifications')
+      .select('id, data')
+      .eq('type', 'webauthn_cred')
+      .eq('user_id', req.user.id);
+    const credentials = (data || []).map(r => ({
+      id: r.id,
+      device_name: r.data?.device_name || 'Biometric device',
+      created_at: r.data?.created_at,
+    }));
+    res.json({ success: true, credentials });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2532,7 +1761,7 @@ app.get('/api/webauthn/credentials', requireAuth, async (req, res) => {
 app.delete('/api/webauthn/credentials/:id', requireAuth, async (req, res) => {
   try {
     if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
-    await supabase.from('webauthn_credentials').delete().eq('id', req.params.id).eq('user_id', req.user.id);
+    await supabase.from('notifications').delete().eq('id', req.params.id).eq('type', 'webauthn_cred').eq('user_id', req.user.id);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2545,7 +1774,7 @@ app.post('/api/webauthn/register/begin', requireAuth, async (req, res) => {
     if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
     const userId = req.user.id;
     const { data: profile } = await supabase.from('profiles').select('email, full_name').eq('id', userId).single();
-    const { data: existing } = await supabase.from('webauthn_credentials').select('credential_id').eq('user_id', userId);
+    const { data: existing } = await supabase.from('notifications').select('data').eq('type', 'webauthn_cred').eq('user_id', userId);
     const options = await generateRegistrationOptions({
       rpName: RP_NAME,
       rpID: RP_ID,
@@ -2553,13 +1782,13 @@ app.post('/api/webauthn/register/begin', requireAuth, async (req, res) => {
       userID: Buffer.from(userId),
       userDisplayName: profile?.full_name || profile?.email || 'Omix User',
       attestationType: 'none',
-      excludeCredentials: (existing || []).map(c => ({ id: c.credential_id })),
+      excludeCredentials: (existing || []).map(c => ({ id: c.data.credential_id })),
       authenticatorSelection: { residentKey: 'preferred', userVerification: 'preferred' },
       supportedAlgorithmIDs: [-7, -257],
     });
-    await supabase.from('webauthn_challenges').upsert({
-      user_id: userId, challenge: options.challenge, purpose: 'register', created_at: new Date().toISOString(),
-    }, { onConflict: 'user_id' });
+    await supabase.from('notifications').upsert({
+      type: 'webauthn_challenge', user_id: userId, data: { challenge: options.challenge, purpose: 'register' }, created_at: new Date().toISOString(),
+    }, { onConflict: 'type,user_id' });
     res.json({ success: true, options });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2571,11 +1800,11 @@ app.post('/api/webauthn/register/complete', requireAuth, async (req, res) => {
   try {
     if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
     const userId = req.user.id;
-    const { data: chal } = await supabase.from('webauthn_challenges').select('challenge').eq('user_id', userId).eq('purpose', 'register').single();
+    const { data: chal } = await supabase.from('notifications').select('data').eq('type', 'webauthn_challenge').eq('user_id', userId).eq('data->>purpose', 'register').single();
     if (!chal) return res.status(400).json({ error: 'No active registration challenge' });
     const verification = await verifyRegistrationResponse({
       response: req.body,
-      expectedChallenge: chal.challenge,
+      expectedChallenge: chal.data.challenge,
       expectedOrigin: RP_ORIGIN,
       expectedRPID: RP_ID,
     });
@@ -2584,14 +1813,18 @@ app.post('/api/webauthn/register/complete', requireAuth, async (req, res) => {
     }
     const { credential } = verification.registrationInfo;
     const deviceName = req.body.deviceName || 'Biometric device';
-    await supabase.from('webauthn_credentials').insert({
-      user_id: userId,
-      credential_id: credential.id,
-      public_key: Buffer.from(credential.publicKey).toString('base64'),
-      counter: credential.counter,
-      device_name: deviceName,
+    await supabase.from('notifications').insert({
+      type: 'webauthn_cred', user_id: userId,
+      data: {
+        credential_id: credential.id,
+        public_key: Buffer.from(credential.publicKey).toString('base64'),
+        counter: credential.counter,
+        device_name: deviceName,
+        created_at: new Date().toISOString(),
+      },
+      created_at: new Date().toISOString(),
     });
-    await supabase.from('webauthn_challenges').delete().eq('user_id', userId).eq('purpose', 'register');
+    await supabase.from('notifications').delete().eq('type', 'webauthn_challenge').eq('user_id', userId).eq('data->>purpose', 'register');
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2606,16 +1839,16 @@ app.post('/api/webauthn/login/begin', async (req, res) => {
     if (!email) return res.status(400).json({ error: 'email required' });
     const { data: profile } = await supabase.from('profiles').select('id').eq('email', email).single();
     if (!profile) return res.status(404).json({ error: 'No account found' });
-    const { data: creds } = await supabase.from('webauthn_credentials').select('credential_id').eq('user_id', profile.id);
+    const { data: creds } = await supabase.from('notifications').select('data').eq('type', 'webauthn_cred').eq('user_id', profile.id);
     if (!creds || creds.length === 0) return res.status(404).json({ error: 'No biometric credentials for this account' });
     const options = await generateAuthenticationOptions({
       rpID: RP_ID,
-      allowCredentials: creds.map(c => ({ id: c.credential_id })),
+      allowCredentials: creds.map(c => ({ id: c.data.credential_id })),
       userVerification: 'preferred',
     });
-    await supabase.from('webauthn_challenges').upsert({
-      user_id: profile.id, challenge: options.challenge, purpose: 'login', created_at: new Date().toISOString(),
-    }, { onConflict: 'user_id' });
+    await supabase.from('notifications').upsert({
+      type: 'webauthn_challenge', user_id: profile.id, data: { challenge: options.challenge, purpose: 'login' }, created_at: new Date().toISOString(),
+    }, { onConflict: 'type,user_id' });
     res.json({ success: true, options, userId: profile.id });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2628,25 +1861,25 @@ app.post('/api/webauthn/login/complete', async (req, res) => {
     if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
     const { userId, response } = req.body;
     if (!userId) return res.status(400).json({ error: 'userId required' });
-    const { data: chal } = await supabase.from('webauthn_challenges').select('challenge').eq('user_id', userId).eq('purpose', 'login').single();
+    const { data: chal } = await supabase.from('notifications').select('data').eq('type', 'webauthn_challenge').eq('user_id', userId).eq('data->>purpose', 'login').single();
     if (!chal) return res.status(400).json({ error: 'No active login challenge' });
-    const { data: cred } = await supabase.from('webauthn_credentials').select('*').eq('user_id', userId).eq('credential_id', response.id).single();
+    const { data: cred } = await supabase.from('notifications').select('*').eq('type', 'webauthn_cred').eq('user_id', userId).eq('data->>credential_id', response.id).single();
     if (!cred) return res.status(404).json({ error: 'Unknown credential' });
     const verification = await verifyAuthenticationResponse({
       response,
-      expectedChallenge: chal.challenge,
+      expectedChallenge: chal.data.challenge,
       expectedOrigin: RP_ORIGIN,
       expectedRPID: RP_ID,
       credential: {
-        id: cred.credential_id,
-        publicKey: Buffer.from(cred.public_key, 'base64'),
-        counter: Number(cred.counter),
+        id: cred.data.credential_id,
+        publicKey: Buffer.from(cred.data.public_key, 'base64'),
+        counter: Number(cred.data.counter),
         transports: ['internal', 'hybrid'],
       },
     });
     if (!verification.verified) return res.status(400).json({ error: 'Login verification failed' });
-    await supabase.from('webauthn_credentials').update({ counter: verification.authenticationInfo.newCounter }).eq('id', cred.id);
-    await supabase.from('webauthn_challenges').delete().eq('user_id', userId).eq('purpose', 'login');
+    await supabase.from('notifications').update({ data: { ...cred.data, counter: verification.authenticationInfo.newCounter } }).eq('id', cred.id);
+    await supabase.from('notifications').delete().eq('type', 'webauthn_challenge').eq('user_id', userId).eq('data->>purpose', 'login');
     // Issue a Supabase session for the verified user (service-role)
     const { data: sessionData, error: sessErr } = await supabase.auth.admin.signInWithId({ userId });
     if (sessErr || !sessionData?.session) {
@@ -2677,9 +1910,9 @@ app.post('/api/admin/broadcast', requireAdmin, async (req, res) => {
       return res.status(400).json({ success: false, error: 'subject and body are required' });
     }
 
-    // Respect master toggle from settings
-    const { data: settingRow } = await supabase.from('site_settings').select('value').eq('key', 'broadcast').single();
-    const settings = settingRow?.value || { enabled: true, default_email: true, default_push: true };
+    // Respect master toggle from settings (stored in notifications as type='broadcast_settings')
+    const { data: settingRow } = await supabase.from('notifications').select('data').eq('type', 'broadcast_settings').single();
+    const settings = settingRow?.data || { enabled: true, default_email: true, default_push: true };
     if (settings.enabled === false) {
       return res.status(403).json({ success: false, error: 'Broadcast is currently disabled in settings. Enable it to send.' });
     }
@@ -2792,27 +2025,6 @@ app.delete('/api/affiliate/:id', requireAuth, async (req, res) => {
   }
 });
 
-// ── Admin SQL endpoint (temporary — delete after migrations applied) ──
-app.post('/api/admin/sql', requireAdmin, async (req, res) => {
-  if (!supabase) return res.status(500).json({ message: 'Supabase not configured' });
-  const { query } = req.body;
-  if (!query || typeof query !== 'string') return res.status(400).json({ message: 'query required' });
-  
-  // Only allow DDL statements (CREATE POLICY, ALTER TABLE, DROP POLICY)
-  const allowed = /^(CREATE\s+POLICY|ALTER\s+TABLE|DROP\s+POLICY|GRANT|REVOKE)/i.test(query.trim());
-  if (!allowed) return res.status(403).json({ message: 'Only DDL statements allowed' });
-
-  try {
-    const { data, error } = await supabase.rpc('exec_sql', { sql: query });
-    if (error) {
-      // If exec_sql doesn't exist, try using the Supabase Management API instead
-      return res.status(500).json({ message: 'RPC not available', error: error.message });
-    }
-    res.json({ success: true, data });
-  } catch (err) {
-    res.status(500).json({ message: 'SQL execution failed', error: err.message });
-  }
-});
 
 // ── Admin Analytics Endpoint ──────────────────────────────────
 app.get('/api/admin/analytics', requireAdmin, async (req, res) => {
