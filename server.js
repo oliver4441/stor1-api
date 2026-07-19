@@ -2455,8 +2455,8 @@ app.post('/api/admin/apply-migrations', requireAdmin, async (req, res) => {
       const sqlText = fs.default.readFileSync(path.default.join(migDir, f), 'utf8');
       const r = await fetch(`${SUPABASE_URL}/rest/v1/sql`, {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${SERVICE_KEY}`, 'apikey': SERVICE_KEY, 'Content-Type': 'text/plain' },
-        body: sqlText,
+        headers: { 'Authorization': `Bearer ${SERVICE_KEY}`, 'apikey': SERVICE_KEY, 'Content-Type': 'application/json' },
+        body: JSON.stringify(sqlText),
       });
       if (!r.ok) {
         const err = await r.text();
