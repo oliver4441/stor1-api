@@ -37,7 +37,7 @@ CREATE INDEX IF NOT EXISTS idx_monthly_commissions_period ON public.monthly_comm
 
 -- 3. RESEED TIERS TO MATCH LEGAL AGREEMENT (2-tier: Silver 5%, Gold 10%)
 -- Legal docs state: Silver = 5% (0-29 orders), Gold = 10% (30+ orders)
-DELETE FROM public.affiliate_tiers;
+TRUNCATE public.affiliate_tiers CASCADE;
 INSERT INTO public.affiliate_tiers (name, level, min_orders, min_sales, commission_rate, bonus_rate, description)
 VALUES
   ('Silver', 1, 0,  0,     0.0500, 0, '0-29 orders — 5% commission'),
