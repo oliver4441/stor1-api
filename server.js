@@ -13,6 +13,7 @@ import webpush from 'web-push';
 import { createClient } from '@supabase/supabase-js';
 import { InferenceClient } from '@huggingface/inference';
 import emailLib from './lib/email.js';
+import { sendNotification as onesignalSend } from './lib/onesignal.js';
 import rateLimit from 'express-rate-limit';
 import { body, param, validationResult } from 'express-validator';
 import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } from '@simplewebauthn/server';
@@ -1989,7 +1990,14 @@ app.post('/api/admin/broadcast', requireAdmin, async (req, res) => {
       } catch (e) { console.warn('[Broadcast] push failed', e.message); }
     }
 
-    res.json({ success: true, emailSent, pushSent, totalUsers: emails.length });
+    // OneSignal push (fire-and-forget alongside existing web push)
+    let onesignalSent = 0;
+    try {
+      const r = await onesignalSend({ headings: subject, contents: body.slice(0, 200), url: '/' });
+      if (r.sent) onesignalSent = 1;
+    } catch (e) { console.warn('[Broadcast] OneSignal push failed', e.message); }
+
+    res.json({ success: true, emailSent, pushSent, onesignalSent, totalUsers: emails.length });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
