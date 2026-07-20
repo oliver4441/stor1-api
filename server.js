@@ -747,22 +747,27 @@ app.post('/api/auth/signup', async (req, res) => {
           .single();
 
         if (affiliate) {
-          // Check if user already has a referral attribution
-          const { data: existing } = await supabase
-            .from('referrals')
-            .select('id')
-            .eq('referred_user_id', userId)
-            .single();
+          // Block self-referral
+          if (affiliate.user_id === userId) {
+            console.warn('[Signup] Self-referral blocked for user', userId);
+          } else {
+            // Check if user already has a referral attribution (first-touch)
+            const { data: existing } = await supabase
+              .from('referrals')
+              .select('id')
+              .eq('referred_user_id', userId)
+              .single();
 
-          if (!existing) {
-            await supabase.from('referrals').insert({
-              affiliate_id: affiliate.id,
-              referred_user_id: userId,
-              status: 'pending',
-              referral_code: refCode,
-            });
-            // Also set the legacy profiles.referred_by column
-            await supabase.from('profiles').update({ referred_by: affiliate.id }).eq('id', userId);
+            if (!existing) {
+              await supabase.from('referrals').insert({
+                affiliate_id: affiliate.id,
+                referred_user_id: userId,
+                status: 'pending',
+                referral_code: refCode,
+              });
+              // Also set the legacy profiles.referred_by column
+              await supabase.from('profiles').update({ referred_by: affiliate.id }).eq('id', userId);
+            }
           }
         }
       } catch (refErr) {
@@ -2282,7 +2287,7 @@ async function requireAdmin(req, res, next) {
   }
 }
 
-// List all affiliates
+// List all affiliates (with computed tier)
 app.get('/api/admin/affiliates', requireAdmin, async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -2290,7 +2295,20 @@ app.get('/api/admin/affiliates', requireAdmin, async (req, res) => {
       .select('*')
       .order('created_at', { ascending: false });
     if (error) throw error;
-    res.json({ success: true, data: data || [] });
+
+    // Enrich with computed tier from RPC
+    const enriched = await Promise.all((data || []).map(async (a) => {
+      try {
+        const { data: tierId } = await supabase.rpc('calculate_affiliate_tier', { p_affiliate_id: a.id });
+        if (tierId) {
+          const { data: tier } = await supabase.from('affiliate_tiers').select('name, level').eq('id', tierId).single();
+          return { ...a, tier: tier?.name?.toLowerCase() || 'silver', tier_level: tier?.level || 1 };
+        }
+      } catch {}
+      return { ...a, tier: a.tier || 'silver', tier_level: 1 };
+    }));
+
+    res.json({ success: true, data: enriched });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -2613,8 +2631,8 @@ app.post('/api/admin/commissions/calculate', async (req, res) => {
 async function handleCommissionCalc(req, res) {
   try {
     const now = new Date();
-    const year = parseInt(req.query.year) || now.getFullYear();
-    const month = parseInt(req.query.month) || (now.getMonth() + 1); // 1-indexed
+    const year = parseInt(req.query.year || req.body?.year) || now.getFullYear();
+    const month = parseInt(req.query.month || req.body?.month) || (now.getMonth() + 1); // 1-indexed
 
     // Get all active affiliates
     const { data: affiliates, error: affError } = await supabase
@@ -2906,6 +2924,26 @@ app.patch('/api/admin/payout-requests/:id/approve', requireAdmin, async (req, re
     }
 
     res.json({ success: true, data: payout });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Admin: Process payout directly ────────────────────────────
+// POST /api/admin/payouts/:id/process — triggers payout processing
+app.post('/api/admin/payouts/:id/process', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: payout, error } = await supabase
+      .from('payout_requests')
+      .update({ status: 'processing', processed_at: new Date().toISOString(), processed_by: req.user.id })
+      .eq('id', id)
+      .eq('status', 'pending')
+      .select()
+      .single();
+    if (error) throw error;
+    if (!payout) return res.status(400).json({ success: false, error: 'Payout not found or already processed' });
+    res.json({ success: true, data: payout, message: 'Payout processing initiated' });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
