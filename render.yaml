@@ -24,3 +24,7 @@ services:
         sync: false
       - key: PORT
         value: "3001"
+      - key: ONESIGNAL_APP_ID
+        sync: false
+      - key: ONESIGNAL_API_KEY
+        sync: false
