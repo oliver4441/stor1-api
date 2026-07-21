@@ -2724,6 +2724,138 @@ app.post('/api/admin/sellers/:id/reject', requireAdmin, async (req, res) => {
   }
 });
 
+// GET /api/admin/activity-logs — Recent platform activity (fraud monitoring, audits)
+app.get('/api/admin/activity-logs', requireAdmin, async (req, res) => {
+  try {
+    const { limit = 50, action, actor_type, days = 7 } = req.query;
+    const maxLimit = Math.min(parseInt(limit) || 50, 200);
+    const since = new Date(Date.now() - parseInt(days) * 86400000).toISOString();
+
+    let query = supabase
+      .from('activity_logs')
+      .select('*')
+      .gte('created_at', since)
+      .order('created_at', { ascending: false })
+      .limit(maxLimit);
+
+    if (action) query = query.eq('action', action);
+    if (actor_type) query = query.eq('actor_type', actor_type);
+
+    const { data: logs, error } = await query;
+    if (error) throw error;
+
+    res.json({ success: true, data: logs || [] });
+  } catch (err) {
+    console.error('[Admin Activity Logs] Error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/admin/fraud-alerts — Suspicious signup patterns
+app.get('/api/admin/fraud-alerts', requireAdmin, async (req, res) => {
+  try {
+    const alerts = [];
+
+    // 1. Same IP, multiple accounts (potential duplicate fraud)
+    const { data: ipClusters } = await supabase.rpc('exec_sql_raw', {
+      query_text: `
+        SELECT signup_ip, COUNT(*) as account_count, 
+               array_agg(DISTINCT email) as emails,
+               MAX(created_at) as latest_signup
+        FROM profiles 
+        WHERE signup_ip IS NOT NULL AND signup_ip != ''
+        GROUP BY signup_ip
+        HAVING COUNT(*) >= 3
+        ORDER BY COUNT(*) DESC
+        LIMIT 20
+      `
+    });
+
+    // Fallback if RPC not available
+    let ipData = ipClusters;
+    if (!ipData) {
+      const { data: profiles } = await supabase
+        .from('profiles')
+        .select('id, email, signup_ip, created_at')
+        .not('signup_ip', 'is', null)
+        .neq('signup_ip', '')
+        .limit(500);
+
+      const ipMap = {};
+      (profiles || []).forEach(p => {
+        if (!ipMap[p.signup_ip]) ipMap[p.signup_ip] = { ips: [], count: 0 };
+        ipMap[p.signup_ip].count++;
+        if (ipMap[p.signup_ip].count <= 5) {
+          ipMap[p.signup_ip].ips.push(p);
+        }
+      });
+
+      ipData = Object.entries(ipMap)
+        .filter(([, v]) => v.count >= 3)
+        .map(([ip, v]) => ({
+          signup_ip: ip,
+          account_count: v.count,
+          sample_emails: v.ips.map(p => p.email).slice(0, 5),
+        }))
+        .sort((a, b) => b.account_count - a.account_count)
+        .slice(0, 20);
+    }
+
+    if (ipData?.length > 0) {
+      alerts.push({
+        type: 'duplicate_ip',
+        severity: ipData[0].account_count >= 10 ? 'high' : 'medium',
+        title: 'Multiple accounts from same IP',
+        description: `${ipData.length} IPs with 3+ accounts each`,
+        details: ipData.slice(0, 5),
+        count: ipData.length,
+      });
+    }
+
+    // 2. Check for recently created accounts using disposable email domains
+    // (This would need a disposable email list — we block at signup but can report)
+    const { data: recentSignups } = await supabase
+      .from('profiles')
+      .select('id, email, created_at')
+      .gte('created_at', new Date(Date.now() - 86400000 * 2).toISOString())
+      .order('created_at', { ascending: false })
+      .limit(5);
+
+    if (recentSignups?.length > 0) {
+      alerts.push({
+        type: 'recent_signups',
+        severity: 'info',
+        title: 'Recent account registrations',
+        description: `${recentSignups.length} accounts created in last 48 hours`,
+        details: recentSignups.map(s => ({ email: s.email, created_at: s.created_at })),
+        count: recentSignups.length,
+      });
+    }
+
+    // 3. Pending affiliate applications needing review
+    const { data: pendingAffiliates, count: pendingCount } = await supabase
+      .from('affiliates')
+      .select('id', { count: 'exact', head: true })
+      .eq('status', 'pending');
+
+    if (pendingCount > 0) {
+      alerts.push({
+        type: 'pending_applications',
+        severity: pendingCount > 20 ? 'high' : 'medium',
+        title: 'Affiliate applications awaiting review',
+        description: `${pendingCount} pending affiliate applications`,
+        details: [],
+        count: pendingCount,
+      });
+    }
+
+    res.json({ success: true, data: alerts });
+  } catch (err) {
+    console.error('[Admin Fraud Alerts] Error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // Calculate monthly commission for all affiliates via PG function
 // POST /api/admin/commissions/calculate?year=2026&month=7
 // Supports ?key=CRON_SECRET for scheduled cron jobs (no JWT expiry issue)
@@ -3515,7 +3647,7 @@ app.get('/api/affiliate/orders/:affiliateId', requireAuth, async (req, res) => {
 // 7. POST /api/affiliate/payout-request — Submit payout request
 app.post('/api/affiliate/payout-request', requireAuth, async (req, res) => {
   try {
-    const { affiliate_id, amount, mpesa_number, mpesa_name } = req.body;
+    const { affiliate_id, amount, mpesa_number, mpesa_name, payment_method, bank_name } = req.body;
     if (!affiliate_id || !amount || !mpesa_number) {
       return res.status(400).json({ error: 'affiliate_id, amount, and mpesa_number required' });
     }
@@ -3555,6 +3687,8 @@ app.post('/api/affiliate/payout-request', requireAuth, async (req, res) => {
         amount: parsedAmount,
         mpesa_number,
         mpesa_name: mpesa_name || '',
+        payment_method: payment_method || 'mpesa',
+        bank_name: bank_name || null,
         status: 'pending',
       })
       .select()
@@ -3606,6 +3740,233 @@ app.get('/api/affiliate/tiers', async (req, res) => {
     if (error) throw error;
     res.json({ success: true, data: data || [] });
   } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 10. GET /api/affiliate/leaderboard — Top affiliates by period
+app.get('/api/affiliate/leaderboard', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+
+    const { period = 'all-time', limit = 20 } = req.query;
+    const maxLimit = Math.min(parseInt(limit) || 20, 100);
+
+    // Build date filter
+    let periodStart = null;
+    if (period === 'daily') periodStart = new Date(Date.now() - 86400000).toISOString();
+    else if (period === 'weekly') periodStart = new Date(Date.now() - 7 * 86400000).toISOString();
+    else if (period === 'monthly') periodStart = new Date(Date.now() - 30 * 86400000).toISOString();
+
+    // Fetch all active affiliates
+    const { data: activeAffiliates } = await supabase
+      .from('affiliates')
+      .select('id, user_id, full_name, referral_code, tier')
+      .eq('status', 'active');
+
+    if (!activeAffiliates?.length) return res.json({ success: true, data: [] });
+
+    const board = [];
+    for (const aff of activeAffiliates) {
+      // Fetch referrals for this affiliate
+      let refQuery = supabase
+        .from('referrals')
+        .select('id, status, referred_user_id')
+        .eq('affiliate_id', aff.id);
+
+      if (periodStart) refQuery = refQuery.gte('converted_at', periodStart);
+
+      const { data: referrals } = await refQuery;
+      const totalRefs = referrals?.length || 0;
+      const converted = referrals?.filter(r => r.status === 'converted') || [];
+      const convertedRefs = converted.length;
+
+      let totalSales = 0;
+      if (convertedRefs > 0) {
+        const convertedIds = converted.map(r => r.referred_user_id);
+        // Chunk by 50 to avoid URL length limits
+        for (let i = 0; i < convertedIds.length; i += 50) {
+          const chunk = convertedIds.slice(i, i + 50);
+          const { data: orders } = await supabase
+            .from('omix_orders')
+            .select('total_amount')
+            .in('user_id', chunk)
+            .in('status', ['paid', 'completed', 'delivered']);
+          totalSales += orders?.reduce((s, o) => s + parseFloat(o.total_amount || 0), 0) || 0;
+        }
+      }
+
+      board.push({
+        id: aff.id,
+        user_id: aff.user_id,
+        full_name: aff.full_name,
+        referral_code: aff.referral_code,
+        tier: aff.tier || 'silver',
+        total_referrals: totalRefs,
+        converted_referrals: convertedRefs,
+        total_sales: totalSales,
+        total_commission: Math.round(totalSales * 0.05 * 100) / 100,
+      });
+    }
+
+    // Sort by sales desc, then referrals desc
+    board.sort((a, b) => b.total_sales - a.total_sales || b.converted_referrals - a.converted_referrals);
+    const ranked = board.slice(0, maxLimit).map((entry, i) => ({ ...entry, rank: i + 1 }));
+
+    res.json({ success: true, data: ranked });
+  } catch (err) {
+    console.error('[Leaderboard] Error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 10. GET /api/affiliate/achievements/:affiliateId — Achievement progress
+app.get('/api/affiliate/achievements/:affiliateId', requireAuth, async (req, res) => {
+  try {
+    const affiliateId = req.params.affiliateId;
+    const { data: affCheck } = await supabase.from('affiliates').select('user_id').eq('id', affiliateId).single();
+    if (!affCheck || affCheck.user_id !== req.user.id) return res.status(403).json({ error: 'Unauthorized' });
+
+    // Get all achievement definitions
+    const { data: allAchievements } = await supabase
+      .from('achievements')
+      .select('*')
+      .order('id');
+
+    // Get already-earned achievements for this user
+    const { data: earnedAchievements } = await supabase
+      .from('user_achievements')
+      .select('achievement_id, earned_at')
+      .eq('user_id', req.user.id);
+
+    const earnedSet = new Set((earnedAchievements || []).map(e => e.achievement_id));
+    const earnedMap = {};
+    (earnedAchievements || []).forEach(e => { earnedMap[e.achievement_id] = e.earned_at; });
+
+    // Gather stats for criteria checking
+    const { data: referrals } = await supabase
+      .from('referrals')
+      .select('status, referred_user_id')
+      .eq('affiliate_id', affiliateId);
+
+    const totalReferrals = referrals?.length || 0;
+    const convertedReferrals = referrals?.filter(r => r.status === 'converted').length || 0;
+
+    const { data: clicks } = await supabase
+      .from('referral_clicks')
+      .select('id', { count: 'exact', head: true })
+      .eq('affiliate_id', affiliateId);
+    const totalClicks = clicks?.length || 0;
+
+    // Orders from converted referrals
+    let maxOrderAmount = 0;
+    let totalSales = 0;
+    if (convertedReferrals > 0) {
+      const convertedIds = referrals.filter(r => r.status === 'converted').map(r => r.referred_user_id);
+      const { data: orders } = await supabase
+        .from('omix_orders')
+        .select('total_amount')
+        .in('user_id', convertedIds)
+        .in('status', ['paid', 'completed', 'delivered']);
+      totalSales = orders?.reduce((s, o) => s + parseFloat(o.total_amount || 0), 0) || 0;
+      maxOrderAmount = Math.max(...(orders || []).map(o => parseFloat(o.total_amount || 0)), 0);
+    }
+
+    // Total commission earned (paid status)
+    const { data: paidCommissions } = await supabase
+      .from('monthly_commissions')
+      .select('commission_amount')
+      .eq('affiliate_id', affiliateId)
+      .eq('status', 'paid');
+    const totalCommissionPaid = paidCommissions?.reduce((s, c) => s + parseFloat(c.commission_amount || 0), 0) || 0;
+
+    // Payout count
+    const { data: payouts, count: payoutCount } = await supabase
+      .from('payouts')
+      .select('id', { count: 'exact', head: true })
+      .eq('affiliate_id', affiliateId)
+      .eq('status', 'completed');
+
+    // Current tier (check if Gold)
+    const { data: affiliate } = await supabase
+      .from('affiliates')
+      .select('tier')
+      .eq('id', affiliateId)
+      .single();
+    const currentTier = affiliate?.tier || 'silver';
+
+    // Check each achievement
+    const results = (allAchievements || []).map(ach => {
+      const alreadyEarned = earnedSet.has(ach.id);
+      let progress = 0;
+      let target = parseFloat(ach.criteria_value);
+      let earned = alreadyEarned;
+      let currentValue = 0;
+
+      switch (ach.criteria_type) {
+        case 'converted_referrals':
+          currentValue = convertedReferrals;
+          earned = earned || convertedReferrals >= target;
+          progress = target > 0 ? Math.min(100, Math.round((convertedReferrals / target) * 100)) : 0;
+          break;
+        case 'total_clicks':
+          currentValue = totalClicks;
+          earned = earned || totalClicks >= target;
+          progress = target > 0 ? Math.min(100, Math.round((totalClicks / target) * 100)) : 0;
+          break;
+        case 'commission_earned':
+          currentValue = totalCommissionPaid;
+          earned = earned || totalCommissionPaid >= target;
+          progress = target > 0 ? Math.min(100, Math.round((totalCommissionPaid / target) * 100)) : 0;
+          break;
+        case 'single_order_value':
+          currentValue = maxOrderAmount;
+          earned = earned || maxOrderAmount >= target;
+          progress = target > 0 ? Math.min(100, Math.round((maxOrderAmount / target) * 100)) : 0;
+          break;
+        case 'payout_completed':
+          currentValue = payoutCount || 0;
+          earned = earned || (payoutCount || 0) >= target;
+          progress = target > 0 ? Math.min(100, Math.round(((payoutCount || 0) / target) * 100)) : 0;
+          break;
+        case 'tier_reached':
+          // tier_reached is the level number: 1=Silver, 2=Gold
+          const tierLevel = currentTier === 'gold' ? 2 : currentTier === 'silver' ? 1 : 0;
+          currentValue = tierLevel;
+          earned = earned || tierLevel >= target;
+          progress = target > 0 ? Math.min(100, Math.round((tierLevel / target) * 100)) : 0;
+          break;
+        case 'leaderboard_rank':
+          // Can't easily check this without a full leaderboard scan
+          // Assume not earned unless already recorded
+          progress = 0;
+          break;
+        default:
+          progress = 0;
+      }
+
+      // Auto-earn if criteria met (will be saved when fetched again)
+      // TODO: consider a batch upsert for auto-earned achievements
+      return {
+        id: ach.id,
+        code: ach.code,
+        name: ach.name,
+        description: ach.description,
+        icon: ach.icon,
+        category: ach.category,
+        tier: ach.tier,
+        criteria_type: ach.criteria_type,
+        criteria_value: target,
+        current_value: currentValue,
+        progress,
+        earned,
+        earned_at: earnedMap[ach.id] || null,
+      };
+    });
+
+    res.json({ success: true, data: results });
+  } catch (err) {
+    console.error('[Achievements] Error:', err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
