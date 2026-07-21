@@ -826,6 +826,14 @@ app.post('/api/auth/signup', async (req, res) => {
     }, { onConflict: 'id' });
     if (profileError) throw new Error('Failed to create profile: ' + profileError.message);
 
+    // Activity log: new signup
+    await supabase.from('activity_logs').insert({
+      actor: 'system',
+      action: 'user_signed_up',
+      details: JSON.stringify({ userId, email, referralCode: refCode || null, ip: signupIp }),
+      created_at: new Date().toISOString(),
+    }).catch(() => {});
+
     // 3. Process referral if provided
     if (refCode) {
       try {
@@ -875,6 +883,14 @@ app.post('/api/auth/signup', async (req, res) => {
                 });
                 // Also set the legacy profiles.referred_by column
                 await supabase.from('profiles').update({ referred_by: affiliate.id }).eq('id', userId);
+
+                // Activity log: referral claimed
+                await supabase.from('activity_logs').insert({
+                  actor: 'system',
+                  action: 'referral_claimed',
+                  details: JSON.stringify({ affiliate_id: affiliate.id, referred_user_id: userId, referral_code: refCode, ip: signupIp }),
+                  created_at: new Date().toISOString(),
+                }).catch(() => {});
               }
             }
           }
@@ -1448,7 +1464,53 @@ app.post('/api/paystack/webhook', async (req, res) => {
               .from('omix_orders')
               .update({ status: 'paid', paystack_reference: reference, paid_at: new Date().toISOString() })
               .eq('id', metadata.order_id);
+
             console.log(`Order ${metadata.order_id} marked as paid`);
+
+            // ── Referral Conversion: Check if this user has a pending referral ──
+            try {
+              const { data: pendingRef } = await supabase
+                .from('referrals')
+                .select('id, affiliate_id, status')
+                .eq('referred_user_id', existing.user_id)
+                .eq('status', 'pending')
+                .maybeSingle();
+
+              if (pendingRef) {
+                await supabase
+                  .from('referrals')
+                  .update({
+                    status: 'converted',
+                    converted_at: new Date().toISOString(),
+                    first_order_id: metadata.order_id,
+                  })
+                  .eq('id', pendingRef.id);
+
+                await supabase.from('activity_logs').insert({
+                  actor: 'system',
+                  action: 'referral_converted',
+                  details: JSON.stringify({
+                    referral_id: pendingRef.id,
+                    affiliate_id: pendingRef.affiliate_id,
+                    referred_user_id: existing.user_id,
+                    order_id: metadata.order_id,
+                    amount: existing.total_amount,
+                  }),
+                  created_at: new Date().toISOString(),
+                }).catch(() => {});
+
+                await supabase.from('affiliate_logs').insert({
+                  affiliate_id: pendingRef.affiliate_id,
+                  event_type: 'REFERRAL_CONVERTED',
+                  details: { referral_id: pendingRef.id, order_id: metadata.order_id, amount: existing.total_amount },
+                }).catch(() => {});
+
+                console.log(`[Referral] Converted ${pendingRef.id} for user ${existing.user_id} via order ${metadata.order_id}`);
+              }
+            } catch (convErr) {
+              console.error('[Referral] Conversion error:', convErr.message);
+            }
+
           } else if (existing?.status === 'paid') {
             console.log(`Order ${metadata.order_id} already paid, skipping update`);
           }
@@ -3963,6 +4025,21 @@ app.get('/api/affiliate/achievements/:affiliateId', requireAuth, async (req, res
         earned_at: earnedMap[ach.id] || null,
       };
     });
+
+    // Persist newly-earned achievements to user_achievements table
+    const newlyEarned = results.filter(r => r.earned && !r.earned_at);
+    if (newlyEarned.length > 0) {
+      const upsertData = newlyEarned.map(ach => ({
+        user_id: req.user.id,
+        achievement_id: ach.id,
+        earned_at: new Date().toISOString(),
+      }));
+      await supabase.from('user_achievements').upsert(upsertData, {
+        onConflict: 'user_id,achievement_id',
+      }).catch(err => console.error('[Achievements] Upsert error:', err.message));
+      // Mark earned_at in the response so frontend sees it as fresh-earned
+      newlyEarned.forEach(ach => { ach.earned_at = new Date().toISOString(); });
+    }
 
     res.json({ success: true, data: results });
   } catch (err) {
