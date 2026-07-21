@@ -3512,7 +3512,7 @@ app.post('/api/affiliates/apply', async (req, res) => {
     }
 
     // Generate unique referral code
-    const refSuffix = Math.random().toString(36).substring(2, 6).toUpperCase();
+    const refSuffix = userId.replace(/-/g, '').slice(0, 6).toUpperCase();
     const referral_code = `AFF-${refSuffix}`;
 
     const insertData = {
