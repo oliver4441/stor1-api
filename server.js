@@ -27,6 +27,7 @@ const RP_ORIGIN = FRONTEND_ORIGIN;
 const RP_ID = (() => { try { return new URL(FRONTEND_ORIGIN).hostname; } catch { return 'stor1-web.onrender.com'; } })();
 
 const app = express();
+app.set('trust proxy', 1); // Render sits behind proxy — needed for accurate req.ip
 app.use(helmet({
   contentSecurityPolicy: false,
   crossOriginEmbedderPolicy: false,
@@ -58,6 +59,62 @@ const authLimiter = rateLimit({
   message: { error: 'Too many login attempts, please try again later.' }
 });
 app.use('/api/auth/', authLimiter);
+
+// Stricter limit for signup (mass account creation / fraud prevention)
+const signupLimiter = rateLimit({
+  windowMs: 24 * 60 * 60 * 1000, // 24 hours
+  max: 5, // max 5 signups per IP per day
+  message: { error: 'Too many accounts created from this IP. Please contact support.' }
+});
+app.use('/api/auth/signup', signupLimiter);
+
+// Disposable email domain blocklist (fraud prevention)
+const DISPOSABLE_DOMAINS = new Set([
+  'mailinator.com','guerrillamail.com','10minutemail.com','tempmail.com',
+  'throwaway.email','yopmail.com','trashmail.com','sharklasers.com',
+  'maildrop.cc','getnada.com','temp-mail.org','fakeinbox.com',
+  'mailtrap.io','dispostable.com','spamgourmet.com','mytemp.email',
+  'tempemail.co','emailondeck.com','mailexpire.com','burnermail.io',
+  'temporary-mail.net','spambox.us','mailnator.com','mintemail.com',
+  'moakt.com','spambog.com','spamavert.com','discard.email',
+  'anonmails.de','wegwerfmail.de','trash2009.com','thankyou2010.com',
+  'mt2009.com','trashymail.com','tyldd.com','uggsrock.com',
+  'wegwerfmail.net','wegwerfmail.org','wh4f.org','whyspam.me',
+  'willselfdestruct.com','winemaven.info','wronghead.com','wuzup.net',
+  'xagloo.com','xemaps.com','xents.com','xmaily.com','xoxy.net',
+  'yep.it','yogamaven.com','yopmail.fr','yopmail.net','ypmail.webarnak.fr.eu.org',
+  's0ny.net','s33db0x.com','sabrestorage.com','safe-mail.net','salegear.com',
+  'saynotospams.com','scatmail.com','selfdestructingmail.com','sendspamhere.com',
+  'sharrmail.com','shortmail.net','skeefmail.com','slaskpost.se','slopsbox.com',
+  'smellfear.com','snakemail.com','sneakemail.com','sofimail.com',
+  'solvemail.info','spam4.me','spamail.de','spamarrest.com',
+  'spamcon.org','spamcowboy.com','spamex.com','spamfighter.de',
+  'spamfree24.org','spamgoes.in','spamhereplease.com','spamhole.com',
+  'spamify.com','spaminator.de','spamkill.info','spaml.com',
+  'spamobox.com','spamslicer.com','spamspot.com','spamthis.co.uk',
+  'spamthisplease.com','spamtrail.com','speed.1s.fr','superrito.com',
+  'suremail.info','teewars.org','teleosaurs.xyz','temp-inbox.com',
+  'tempail.com','tempemail.biz','tempemail.co.za','tempinbox.com',
+  'tempmail.co','tempmail.it','tempmail.us','tempomail.fr',
+  'tempsky.com','temporaryemail.us','temporaryforwarding.com',
+  'temporaryinbox.com','thankyou2010.com','thc.st','thecloudindex.com',
+  'thisisnotmyrealemail.com','throwaway.de','throwawayemail.com',
+  'tilien.com','trash2009.com','trash-amil.com','trashdevil.de',
+  'trashymail.com','trbvm.com','tropicalbiker.info','trunc.it',
+  'tuyulmoklet.org','tyldd.com','uggsrock.com','ugmail.eu','uk-berlin.de',
+  'ultra.fyi','umuqo.xyz','upmails.com','uroid.com','us.af',
+  'venompen.com','veryrealemail.com','viditb.com','viewcastmedia.com',
+  'viewcastmedia.net','vjp.at','vmani.com','vomoto.com','vpn.st',
+  'vr9.com','wagfused.com','warez-download.org','wargan.biz',
+  'weg-werf-mail.de','wegwerfmail.de','wegwerfmail.net','wegwerfmail.org',
+  'wetrainbayarea.com','wh4f.org','whatiaas.com','whatpaas.com','whyspam.me',
+  'willselfdestruct.com','winemaven.info','wir-haben-nachwuchs.de',
+  'wlistp.com','wokcy.com','wpg.im','wronghead.com','wuzup.net',
+  'xagloo.com','xemaps.com','xents.com','xmaily.com','xoxox.cc',
+  'xoxy.net','xwaretech.com','xww.ro','yapped.net','yep.it',
+  'yogamaven.com','yopmail.fr','yopmail.net','ypmail.webarnak.fr.eu.org',
+  'yuurok.com','zehnminutenmail.de','zippymail.info','zoaxe.com','zoemail.org'
+]);
 
 app.use(express.json({
   limit: '1mb',
@@ -713,6 +770,38 @@ app.post('/api/auth/signup', async (req, res) => {
       return res.status(400).json({ error: 'Password must be at least 6 characters' });
     }
 
+    // Fraud prevention: block disposable/temporary email domains
+    const emailDomain = email.split('@')[1]?.toLowerCase();
+    if (emailDomain && DISPOSABLE_DOMAINS.has(emailDomain)) {
+      return res.status(400).json({ error: 'Disposable email addresses are not allowed. Please use a permanent email.' });
+    }
+
+    const signupIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
+
+    // Fraud prevention: check if this IP has already referred too many accounts
+    if (refCode) {
+      const { count: ipCount } = await supabase
+        .from('profiles')
+        .select('id', { count: 'exact', head: true })
+        .eq('signup_ip', signupIp);
+
+      if (ipCount && ipCount >= 3) {
+        console.warn(`[Fraud] IP ${signupIp} has ${ipCount} signups — blocking new referral attribution`);
+        // Let the signup proceed but silently skip referral attribution
+        const refCodeBlocked = refCode;
+        refCode = null; // Silently drop referral — user still created
+        // Flag for admin review later
+        try {
+          await supabase.from('activity_logs').insert({
+            actor: 'system',
+            action: 'fraud_ip_blocked',
+            details: JSON.stringify({ ip: signupIp, count: ipCount, refCode: refCodeBlocked }),
+            created_at: new Date().toISOString(),
+          }).catch(() => {});
+        } catch (_) {}
+      }
+    }
+
     // 1. Create auth user with email auto-confirmed (uses service key)
     const { data: authData, error: authError } = await supabase.auth.admin.createUser({
       email,
@@ -733,6 +822,7 @@ app.post('/api/auth/signup', async (req, res) => {
       role: 'customer',
       loyalty_points: 0,
       referral_code: genRefCode,
+      signup_ip: signupIp,
     }, { onConflict: 'id' });
     if (profileError) throw new Error('Failed to create profile: ' + profileError.message);
 
@@ -760,14 +850,32 @@ app.post('/api/auth/signup', async (req, res) => {
               .single();
 
             if (!existing) {
-              await supabase.from('referrals').insert({
-                affiliate_id: affiliate.id,
-                referred_user_id: userId,
-                status: 'pending',
-                referral_code: refCode,
-              });
-              // Also set the legacy profiles.referred_by column
-              await supabase.from('profiles').update({ referred_by: affiliate.id }).eq('id', userId);
+              // Fraud: check if same IP has already been referred by this affiliate
+              const { count: ipRefCount } = await supabase
+                .from('referrals')
+                .select('id', { count: 'exact', head: true })
+                .eq('affiliate_id', affiliate.id)
+                .eq('referred_ip', signupIp);
+
+              if (ipRefCount && ipRefCount >= 2) {
+                console.warn(`[Fraud] IP ${signupIp} already referred ${ipRefCount}x for affiliate ${affiliate.id} — blocking`);
+                await supabase.from('activity_logs').insert({
+                  actor: 'system',
+                  action: 'fraud_ip_referral_blocked',
+                  details: JSON.stringify({ ip: signupIp, affiliateId: affiliate.id, count: ipRefCount, userId }),
+                  created_at: new Date().toISOString(),
+                }).catch(() => {});
+              } else {
+                await supabase.from('referrals').insert({
+                  affiliate_id: affiliate.id,
+                  referred_user_id: userId,
+                  status: 'pending',
+                  referral_code: refCode,
+                  referred_ip: signupIp,
+                });
+                // Also set the legacy profiles.referred_by column
+                await supabase.from('profiles').update({ referred_by: affiliate.id }).eq('id', userId);
+              }
             }
           }
         }
