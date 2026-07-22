@@ -3246,7 +3246,7 @@ app.post('/api/admin/payouts/:id/process', requireAdmin, async (req, res) => {
     const { id } = req.params;
     const { data: payout, error } = await supabase
       .from('payout_requests')
-      .update({ status: 'processing', processed_at: new Date().toISOString(), processed_by: req.user.id })
+      .update({ status: 'paid', processed_at: new Date().toISOString(), processed_by: req.user.id })
       .eq('id', id)
       .eq('status', 'pending')
       .select()
