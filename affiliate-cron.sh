@@ -22,7 +22,7 @@ MONTH=$((10#$MONTH))
 curl -s -X POST "${SUPABASE_URL}/rest/v1/rpc/exec_sql" \
   -H "Content-Type: application/json" \
   -H "apikey: ${SKEY}" \
-  -H "Authorization: Bearer *** \
+  -H "Authorization: Bearer ${SKEY} " \
   -d "$(python3 -c "
 import json
 sql = f'SELECT public.calculate_monthly_commission({YEAR}, {MONTH});'
