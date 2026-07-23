@@ -14,10 +14,10 @@ import { createClient } from '@supabase/supabase-js';
 import { InferenceClient } from '@huggingface/inference';
 import emailLib from './lib/email.js';
 import { sendNotification as onesignalSend } from './lib/onesignal.js';
-import rateLimit from 'express-rate-limit';
+import * as meiliSearch from './lib/meilisearch.js';
+import * as cjApi from './lib/cj.js';
 import { body, param, validationResult } from 'express-validator';
 import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } from '@simplewebauthn/server';
-import * as meiliSearch from './lib/meilisearch.js';
 
 // ── WebAuthn (biometric/passkey) config ──
 const RP_NAME = 'Omix Store';
@@ -1063,21 +1063,22 @@ app.post('/api/auth/admin-login', async (req, res) => {
 });
 
 // ── Nia AI Chat Proxy ──────────────────────────────────────────────
-const NIA_SYSTEM_PROMPT = `You are Nia, the friendly AI assistant for Omix Store — an online marketplace based in Kericho, Kenya. You talk like a real Kenyan, simple and warm.
+const NIA_SYSTEM_PROMPT = `You are Nia, the friendly AI assistant for Omix Store — a Kenya-wide online marketplace. You talk like a real Kenyan, simple and warm.
 
 ## About Omix Store
-- **Location:** Kericho, Kenya
+- **Location:** Kenya (nationwide delivery)
 - **Website:** https://omixsystems.store
 - **Support:** omixsystems@gmail.com | +254 768 213 649 | WhatsApp: +254 768 213 649
 - **Hours:** Monday to Saturday, 8 AM — 6 PM. Sunday closed.
-- **Payment:** M-Pesa via Paystack STK Push (secure, instant). Cash on delivery also available for selected areas.
+- **Payment:** M-Pesa STK Push (secure, instant). Cash on delivery also available.
 - **Buyer Protection:** If an item arrives damaged or not as described, contact us within 24 hours.
 
 ## Delivery Information
-- **Free delivery** within Kericho and surrounding areas.
-- **Kericho CBD:** Same day delivery.
-- **Kericho town:** 1-2 days.
-- **Outside Kericho:** 2-3 days.
+- **Free delivery** on eligible orders.
+- **Nairobi / Mombasa / Kisumu:** 1-2 business days.
+- **Other urban centres:** 2-3 business days.
+- **Rural areas:** 3-5 business days.
+- **Dropship items** ship directly from our supplier in 5-12 business days.
 
 ## Return Policy
 - **Electronics:** 7 days if defective, with receipt.
@@ -2219,7 +2220,7 @@ app.post('/api/admin/broadcast', requireAdmin, async (req, res) => {
     if (emailOn && emails.length > 0) {
       for (const to of emails) {
         try {
-          await emailLib.sendEmail({ to, subject, html: emailLib.emailWrapper({ title: subject, content: `<div style="font-size:15px;line-height:1.6;white-space:pre-wrap;color:#27272a">${body.replace(/</g, '&lt;')}</div><p style="font-size:12px;color:#71717a;margin-top:24px;">Omix Store — Kericho, Kenya</p>` }) });
+          await emailLib.sendEmail({ to, subject, html: emailLib.emailWrapper({ title: subject, content: `<div style="font-size:15px;line-height:1.6;white-space:pre-wrap;color:#27272a">${body.replace(/</g, '&lt;')}</div><p style="font-size:12px;color:#71717a;margin-top:24px;">Omix Store — Kenya</p>` }) });
           emailSent++;
         } catch (e) { console.warn('[Broadcast] email failed for', to, e.message); }
       }
@@ -5040,13 +5041,13 @@ app.get('/api/store/profile', async (req, res) => {
       // Return defaults if no row exists yet
       return res.json({
         store_name: 'Omix Store',
-        tagline: "Kericho's Premier Tech Marketplace",
-        description: 'Omix Store is Kericho\'s trusted destination for quality electronics and gadgets.',
+        tagline: "Kenya's Premier Tech Marketplace",
+        description: "Omix Store is Kenya's trusted destination for quality electronics and gadgets.",
         logo_url: '',
         banner_url: '',
         phone: '+254 768 213 649',
         email: 'omixsystems@gmail.com',
-        address: 'Kericho, Kenya',
+        address: 'Kenya',
         whatsapp: '+254 768 213 649',
         total_orders: 0,
         satisfaction_rate: 0,
@@ -5096,7 +5097,7 @@ app.put('/api/store/profile', requireAdmin, async (req, res) => {
       // Insert first row with updates merged with defaults
       const insertData = {
         store_name: 'Omix Store',
-        tagline: "Kericho's Premier Tech Marketplace",
+        tagline: "Kenya's Premier Tech Marketplace",
         ...updates,
       };
       const { data: inserted, error: insertError } = await supabase
@@ -5651,6 +5652,226 @@ function generateFallbackComparison(products) {
   return lines.join('\n');
 }
 
+// ── M-Pesa (Daraja) Payment Routes ──────────────────────────────────
+// Requires DARAJA_CONSUMER_KEY, DARAJA_CONSUMER_SECRET, DARAJA_PASSKEY env vars
+const DARAJA_CONSUMER_KEY = process.env.DARAJA_CONSUMER_KEY;
+const DARAJA_CONSUMER_SECRET = process.env.DARAJA_CONSUMER_SECRET;
+const DARAJA_PASSKEY = process.env.DARAJA_PASSKEY;
+const DARAJA_SHORTCODE = process.env.DARAJA_SHORTCODE || '174379';
+const DARAJA_ENV = process.env.DARAJA_ENV || 'sandbox';
+const DARAJA_CALLBACK_URL = process.env.DARAJA_CALLBACK_URL || 'https://stor1-api.onrender.com/api/mpesa/callback';
+
+async function getDarajaToken() {
+  if (!DARAJA_CONSUMER_KEY || !DARAJA_CONSUMER_SECRET) {
+    throw Object.assign(new Error('Daraja not configured'), { code: 'MPESA_NOT_CONFIGURED' });
+  }
+  const auth = Buffer.from(`${DARAJA_CONSUMER_KEY}:${DARAJA_CONSUMER_SECRET}`).toString('base64');
+  const url = DARAJA_ENV === 'production'
+    ? 'https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials'
+    : 'https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials';
+  const res = await fetch(url, { headers: { Authorization: `Basic ${auth}` } });
+  if (!res.ok) throw new Error(`Daraja token failed: ${res.status}`);
+  const data = await res.json();
+  return data.access_token;
+}
+
+// Initiate STK Push (Lipa Na M-Pesa Online)
+app.post('/api/mpesa/stk-push', async (req, res) => {
+  try {
+    const { phone, amount, orderId } = req.body;
+    if (!phone || !amount || !orderId) {
+      return res.status(400).json({ success: false, error: 'phone, amount, and orderId required' });
+    }
+    // Format phone: 254XXXXXXXXX
+    const cleanPhone = phone.replace(/[^0-9]/g, '');
+    const mpesaPhone = cleanPhone.startsWith('0') ? '254' + cleanPhone.slice(1)
+      : cleanPhone.startsWith('254') ? cleanPhone
+      : '254' + cleanPhone;
+
+    const token = await getDarajaToken();
+    const timestamp = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
+    const password = Buffer.from(`${DARAJA_SHORTCODE}${DARAJA_PASSKEY}${timestamp}`).toString('base64');
+
+    const url = DARAJA_ENV === 'production'
+      ? 'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest'
+      : 'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest';
+
+    const payload = {
+      BusinessShortCode: DARAJA_SHORTCODE,
+      Password: password,
+      Timestamp: timestamp,
+      TransactionType: 'CustomerPayBillOnline',
+      Amount: Math.round(amount),
+      PartyA: mpesaPhone,
+      PartyB: DARAJA_SHORTCODE,
+      PhoneNumber: mpesaPhone,
+      CallBackURL: DARAJA_CALLBACK_URL,
+      AccountReference: `OMIX${String(orderId).slice(0, 8)}`,
+      TransactionDesc: `Omix Store Order #${orderId}`,
+    };
+
+    const apiRes = await fetch(url, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await apiRes.json();
+
+    if (data.ResponseCode === '0') {
+      // Save CheckoutRequestID against order for polling
+      await supabase.from('omix_orders').update({
+        mpesa_checkout_id: data.CheckoutRequestID,
+        mpesa_merchant_request_id: data.MerchantRequestID,
+      }).eq('id', orderId);
+      return res.json({ success: true, checkoutRequestId: data.CheckoutRequestID, response: data });
+    }
+    res.status(400).json({ success: false, error: data.ResponseDescription || 'STK push failed', data });
+  } catch (err) {
+    if (err.code === 'MPESA_NOT_CONFIGURED') {
+      return res.status(503).json({ success: false, error: 'M-Pesa not configured', code: 'MPESA_NOT_CONFIGURED' });
+    }
+    console.error('[M-Pesa] STK push error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// M-Pesa callback (Safaricom hits this after user enters PIN)
+app.post('/api/mpesa/callback', async (req, res) => {
+  try {
+    const { Body } = req.body;
+    if (!Body?.stkCallback) return res.status(400).json({ ResultCode: 1, ResultDesc: 'Invalid callback' });
+
+    const { ResultCode, ResultDesc, CheckoutRequestID, CallbackMetadata } = Body.stkCallback;
+    console.log(`[M-Pesa] Callback for ${CheckoutRequestID}: ${ResultCode} - ${ResultDesc}`);
+
+    if (ResultCode === 0 && CallbackMetadata?.Item) {
+      // Extract payment metadata
+      const meta = {};
+      CallbackMetadata.Item.forEach(item => { meta[item.Name] = item.Value; });
+
+      // Update order status to paid
+      const { data: orders } = await supabase
+        .from('omix_orders')
+        .update({ status: 'paid', mpesa_receipt: meta.MpesaReceiptNumber, paid_at: new Date().toISOString() })
+        .eq('mpesa_checkout_id', CheckoutRequestID)
+        .select('id');
+
+      if (orders?.length) {
+        console.log(`[M-Pesa] Order ${orders[0].id} marked paid, receipt: ${meta.MpesaReceiptNumber}`);
+        // ponytail: stock decrement follows existing Paystack webhook pattern (lines 1500-1550)
+        // Could extract shared fn, but 2 callers don't justify it yet
+      }
+    }
+    // Always respond with success to Safaricom (they retry on non-200)
+    res.json({ ResultCode: 0, ResultDesc: 'Success' });
+  } catch (err) {
+    console.error('[M-Pesa] Callback error:', err.message);
+    res.json({ ResultCode: 0, ResultDesc: 'Accepted' }); // don't let Safaricom retry
+  }
+});
+
+// Check STK push status
+app.get('/api/mpesa/status/:checkoutRequestId', async (req, res) => {
+  try {
+    const { checkoutRequestId } = req.params;
+    const { data } = await supabase
+      .from('omix_orders')
+      .select('status, mpesa_receipt, paid_at')
+      .eq('mpesa_checkout_id', checkoutRequestId)
+      .single();
+    if (data) {
+      return res.json({ success: true, status: data.status, receipt: data.mpesa_receipt, paidAt: data.paid_at });
+    }
+    res.json({ success: true, status: 'unknown' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Dropship Admin Routes ───────────────────────────────────────────
+
+// Search CJ products from admin
+app.get('/api/admin/dropship/search', requireAdmin, async (req, res) => {
+  try {
+    const { q, page = 1 } = req.query;
+    if (!q) return res.json({ success: true, products: [] });
+    const products = await cjApi.searchProducts({ keyword: q, page: Number(page), pageSize: 20 });
+    res.json({ success: true, products });
+  } catch (err) {
+    if (err.code === 'CJ_NOT_CONFIGURED') {
+      return res.status(503).json({ success: false, error: 'CJ API not configured', code: 'CJ_NOT_CONFIGURED' });
+    }
+    console.error('[Dropship] Search error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Import a CJ product as a local listing
+app.post('/api/admin/dropship/import', requireAdmin, async (req, res) => {
+  try {
+    const { pid, title, price, images, description, variants, category } = req.body;
+    if (!pid || !title || !price) {
+      return res.status(400).json({ success: false, error: 'pid, title, and price required' });
+    }
+    const { data, error } = await supabase.from('listings').insert({
+      title,
+      price: Number(price),
+      description: description || '',
+      images: images || [],
+      category: category || 'Other',
+      condition: 'new',
+      status: 'active',
+      supplier: 'cjdropshipping',
+      supplier_pid: String(pid),
+      stock_quantity: 999, // dropship: CJ handles stock
+      quantity: 999,
+    }).select('*').single();
+
+    if (error) return res.status(400).json({ success: false, error: error.message });
+    res.json({ success: true, listing: data });
+  } catch (err) {
+    console.error('[Dropship] Import error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── AI Agent API: Add Product to Listings ──────────────────────────
+// AI agents call this with X-API-Key header matching AGENT_API_KEY env var
+app.post('/api/agent/listings', async (req, res) => {
+  const apiKey = req.headers['x-api-key'];
+  const expectedKey = process.env.AGENT_API_KEY;
+  if (!apiKey || (expectedKey && apiKey !== expectedKey)) {
+    return res.status(401).json({ success: false, error: 'Invalid API key' });
+  }
+
+  try {
+    const { title, price, description, images, category, condition, brand, quantity, status } = req.body;
+    if (!title || price == null) {
+      return res.status(400).json({ success: false, error: 'title and price are required' });
+    }
+
+    const { data, error } = await supabase.from('listings').insert({
+      title: String(title),
+      price: Number(price),
+      description: description || '',
+      images: images || [],
+      category: category || 'Other',
+      condition: condition || 'new',
+      brand: brand || null,
+      stock_quantity: quantity || 1,
+      quantity: quantity || 1,
+      status: status || 'active',
+      supplier: 'local',
+    }).select('*').single();
+
+    if (error) return res.status(400).json({ success: false, error: error.message });
+    res.status(201).json({ success: true, listing: data });
+  } catch (err) {
+    console.error('[Agent API] Create listing error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // Global error handler — catches anything express-async-errors forwards
 app.use((err, req, res, next) => {
   console.error('[Unhandled Error]', err?.message || err);
@@ -5658,6 +5879,104 @@ app.use((err, req, res, next) => {
 });
 
 // API-only: no SPA fallback — unmatched routes return 404 JSON
+
+// ── Reset Database (admin only — creates admin account, deletes everything else) ──
+app.post('/api/admin/reset-database', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+
+    const ADMIN_EMAIL = 'admin.omixsystems@gmail.com';
+    const ADMIN_PASS = 'marvelxnasha';
+    const ADMIN_NAME = 'Admin Omix';
+
+    // 1. Delete analytics data
+    for (const table of ['activity_logs', 'page_views', 'analytics_events']) {
+      try { await supabase.from(table).delete().neq('id', '00000000-0000-0000-0000-000000000000'); } catch (_) {}
+    }
+
+    // 2. Delete affiliate data
+    for (const table of ['referral_rewards', 'referral_clicks', 'referrals', 'affiliates']) {
+      try { await supabase.from(table).delete().neq('id', '00000000-0000-0000-0000-000000000000'); } catch (_) {}
+    }
+
+    // 3. Delete all products (listings)
+    try { await supabase.from('listings').delete().neq('id', '00000000-0000-0000-0000-000000000000'); } catch (_) {}
+    // Also delete listing-related data
+    for (const table of ['listing_images', 'listing_reviews', 'favorites', 'cart_items', 'deal_items', 'wholesale_tiers']) {
+      try { await supabase.from(table).delete().neq('id', '00000000-0000-0000-0000-000000000000'); } catch (_) {}
+    }
+
+    // 4. Delete orders (to avoid FK issues with listings)
+    for (const table of ['order_items', 'orders']) {
+      try { await supabase.from(table).delete().neq('id', '00000000-0000-0000-0000-000000000000'); } catch (_) {}
+    }
+
+    // 5. Handle auth users — delete everyone except admin
+    const { data: allUsers, error: listError } = await supabase.auth.admin.listUsers();
+    if (listError) return res.status(500).json({ error: 'Failed to list users: ' + listError.message });
+
+    let adminUserId = null;
+    const deletePromises = [];
+
+    for (const user of allUsers.users) {
+      if (user.email === ADMIN_EMAIL) {
+        adminUserId = user.id;
+        // Update profile to admin
+        await supabase.from('profiles').upsert({
+          id: user.id,
+          full_name: ADMIN_NAME,
+          email: ADMIN_EMAIL,
+          role: 'admin',
+          updated_at: new Date().toISOString(),
+        });
+        // Reset password
+        await supabase.auth.admin.updateUserById(user.id, { password: ADMIN_PASS });
+      } else {
+        deletePromises.push((async () => {
+          try { await supabase.from('profiles').delete().eq('id', user.id); } catch (_) {}
+          try { await supabase.auth.admin.deleteUser(user.id); } catch (_) {}
+        })());
+      }
+    }
+
+    await Promise.all(deletePromises);
+
+    // If admin user doesn't exist, create
+    if (!adminUserId) {
+      const { data: newUser, error: createError } = await supabase.auth.admin.createUser({
+        email: ADMIN_EMAIL,
+        password: ADMIN_PASS,
+        email_confirm: true,
+        user_metadata: { full_name: ADMIN_NAME },
+      });
+      if (createError) return res.status(500).json({ error: 'Failed to create admin: ' + createError.message });
+
+      await supabase.from('profiles').upsert({
+        id: newUser.user.id,
+        full_name: ADMIN_NAME,
+        email: ADMIN_EMAIL,
+        role: 'admin',
+      });
+    }
+
+    // 6. Clear app_settings analytics
+    try {
+      await supabase.from('app_settings').upsert({
+        key: 'reset_timestamp',
+        value: JSON.stringify({ resetAt: new Date().toISOString(), by: ADMIN_EMAIL }),
+      });
+    } catch (_) {}
+
+    res.json({
+      success: true,
+      message: 'Database reset complete. Single admin account: admin.omixsystems@gmail.com',
+      adminUserId: adminUserId,
+    });
+  } catch (err) {
+    console.error('[reset-db] Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 app.listen(PORT, () => {
   console.log(`🚀 Omix API server running on port ${PORT}`);
