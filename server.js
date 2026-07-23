@@ -923,6 +923,21 @@ app.post('/api/auth/signup', async (req, res) => {
                     }
                   })
                   .catch(() => {});
+
+                // In-app notification for affiliate: new referral signup
+                try {
+                  await supabase.from('notifications').insert({
+                    user_id: affiliate.user_id,
+                    type: 'REFERRAL_SIGNUP',
+                    title: 'New Referral Signup',
+                    body: 'Someone signed up using your referral link! When they place their first order, you will earn a commission.',
+                    url: '/affiliate-dashboard',
+                    tag: 'referral',
+                    created_at: new Date().toISOString(),
+                  });
+                } catch (notifErr) {
+                  console.warn('[Notif] Failed to create referral signup notification:', notifErr.message);
+                }
               }
             }
           }
@@ -5163,6 +5178,28 @@ app.post('/api/admin/orders/:id/status',
                 }
               })
               .catch(() => {});
+
+            // In-app notification for affiliate: commission earned
+            try {
+              const { data: affRec } = await supabase
+                .from('affiliates')
+                .select('user_id')
+                .eq('id', pendingRef.affiliate_id)
+                .single();
+              if (affRec?.user_id) {
+                await supabase.from('notifications').insert({
+                  user_id: affRec.user_id,
+                  type: 'REFERRAL_CONVERTED',
+                  title: 'Commission Earned!',
+                  body: `You earned KES ${Math.round((order.data.total_amount || 0) * 0.05).toLocaleString()} commission from a referral order of KES ${Math.round((order.data.total_amount || 0)).toLocaleString()}.`,
+                  url: '/affiliate-dashboard',
+                  tag: 'commission',
+                  created_at: new Date().toISOString(),
+                });
+              }
+            } catch (notifErr) {
+              console.warn('[Notif] Failed to create commission notification:', notifErr.message);
+            }
 
             console.log(`[Referral] Converted ${pendingRef.id} via delivered order ${id}`);
           }
