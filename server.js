@@ -891,6 +891,20 @@ app.post('/api/auth/signup', async (req, res) => {
                   details: JSON.stringify({ affiliate_id: affiliate.id, referred_user_id: userId, referral_code: refCode, ip: signupIp }),
                   created_at: new Date().toISOString(),
                 }).catch(() => {});
+
+                // Send referral signup email to affiliate (fire-and-forget)
+                supabase.from('affiliates').select('email, full_name, referral_code').eq('id', affiliate.id).single()
+                  .then(({ data: affData }) => {
+                    if (affData?.email) {
+                      emailLib.sendReferralSignup({
+                        to: affData.email,
+                        referralCode: affData.referral_code,
+                        customerName: affData.full_name,
+                        referredName: 'New customer',
+                      }).catch(err => console.warn('[Email] Referral signup notification failed:', err.message));
+                    }
+                  })
+                  .catch(() => {});
               }
             }
           }
@@ -5116,6 +5130,21 @@ app.post('/api/admin/orders/:id/status',
             await supabase.from('referrals').update({ status: 'converted', converted_at: new Date().toISOString(), first_order_id: id }).eq('id', pendingRef.id);
             await supabase.from('activity_logs').insert({ actor: 'system', action: 'referral_converted', details: JSON.stringify({ referral_id: pendingRef.id, affiliate_id: pendingRef.affiliate_id, referred_user_id: order.data.user_id, order_id: id, amount: order.data.total_amount }), created_at: new Date().toISOString() }).catch(() => {});
             await supabase.from('affiliate_logs').insert({ affiliate_id: pendingRef.affiliate_id, event_type: 'REFERRAL_CONVERTED', details: { referral_id: pendingRef.id, order_id: id, amount: order.data.total_amount } }).catch(() => {});
+
+            // Send referral reward email to affiliate (fire-and-forget)
+            supabase.from('affiliates').select('email, referral_code, full_name').eq('id', pendingRef.affiliate_id).single()
+              .then(({ data: affData }) => {
+                if (affData?.email) {
+                  emailLib.sendReferralReward({
+                    to: affData.email,
+                    referralCode: affData.referral_code,
+                    rewardAmount: Math.round((order.data.total_amount || 0) * 0.05),
+                    customerName: affData.full_name,
+                  }).catch(err => console.warn('[Email] COD referral reward failed:', err.message));
+                }
+              })
+              .catch(() => {});
+
             console.log(`[Referral] Converted ${pendingRef.id} via delivered order ${id}`);
           }
         }
