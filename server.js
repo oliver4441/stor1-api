@@ -163,6 +163,43 @@ if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
   console.warn('[Push] VAPID keys not set — push sending disabled');
 }
 
+// ── Reusable: Send VAPID web push to a specific user ──
+async function sendPushToUser(supabase, userId, payload) {
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return; // VAPID not configured
+  try {
+    const { data: subs, error } = await supabase
+      .from('push_subscriptions')
+      .select('endpoint, p256dh_key, auth_key')
+      .eq('user_id', userId);
+    if (error || !subs?.length) return;
+    for (const sub of subs) {
+      try {
+        const subscription = {
+          endpoint: sub.endpoint,
+          keys: { p256dh: sub.p256dh_key, auth: sub.auth_key },
+        };
+        await webpush.sendNotification(subscription, JSON.stringify({
+          title: payload.title || 'Omix Store',
+          body: payload.body || '',
+          icon: payload.icon || '/logo192.png',
+          badge: '/logo192.png',
+          tag: payload.tag || 'omix-notification',
+          data: { url: payload.url || '/' },
+          requireInteraction: payload.requireInteraction || false,
+        }));
+      } catch (err) {
+        if (err.statusCode === 410 || err.statusCode === 404) {
+          await supabase.from('push_subscriptions').delete().eq('endpoint', sub.endpoint);
+        } else {
+          console.warn('[Push] send to user failed:', err.message);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[Push] sendPushToUser error:', err.message);
+  }
+}
+
 // Supabase client for maintenance mode checks
 let supabase = null;
 if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
@@ -938,6 +975,14 @@ app.post('/api/auth/signup', async (req, res) => {
                 } catch (notifErr) {
                   console.warn('[Notif] Failed to create referral signup notification:', notifErr.message);
                 }
+
+                // Web push to affiliate: new referral signup
+                sendPushToUser(supabase, affiliate.user_id, {
+                  title: 'New Referral Signup',
+                  body: 'Someone signed up using your referral link! When they place their first order, you will earn a commission.',
+                  url: '/affiliate-dashboard',
+                  tag: 'referral-signup',
+                });
               }
             }
           }
@@ -5199,6 +5244,18 @@ app.post('/api/admin/orders/:id/status',
               }
             } catch (notifErr) {
               console.warn('[Notif] Failed to create commission notification:', notifErr.message);
+            }
+
+            // Web push to affiliate: commission earned
+            if (affRec?.user_id) {
+              const commissionAmount = Math.round((order.data.total_amount || 0) * 0.05).toLocaleString();
+              const orderAmount = Math.round((order.data.total_amount || 0)).toLocaleString();
+              sendPushToUser(supabase, affRec.user_id, {
+                title: 'Commission Earned!',
+                body: `You earned KES ${commissionAmount} commission from a referral order of KES ${orderAmount}.`,
+                url: '/affiliate-dashboard',
+                tag: 'commission-earned',
+              });
             }
 
             console.log(`[Referral] Converted ${pendingRef.id} via delivered order ${id}`);
