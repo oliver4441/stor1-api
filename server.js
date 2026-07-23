@@ -5100,6 +5100,30 @@ app.post('/api/admin/orders/:id/status',
 
     console.log(`[Tracking] Order ${id.slice(0, 8)} status updated to ${status}`);
 
+    // ── Referral Conversion: when COD/delivered order is marked delivered ──
+    if (status === 'delivered') {
+      try {
+        const order = await supabase.from('omix_orders').select('user_id, total_amount').eq('id', id).maybeSingle();
+        if (order?.data?.user_id) {
+          const { data: pendingRef } = await supabase
+            .from('referrals')
+            .select('id, affiliate_id')
+            .eq('referred_user_id', order.data.user_id)
+            .eq('status', 'pending')
+            .maybeSingle();
+
+          if (pendingRef) {
+            await supabase.from('referrals').update({ status: 'converted', converted_at: new Date().toISOString(), first_order_id: id }).eq('id', pendingRef.id);
+            await supabase.from('activity_logs').insert({ actor: 'system', action: 'referral_converted', details: JSON.stringify({ referral_id: pendingRef.id, affiliate_id: pendingRef.affiliate_id, referred_user_id: order.data.user_id, order_id: id, amount: order.data.total_amount }), created_at: new Date().toISOString() }).catch(() => {});
+            await supabase.from('affiliate_logs').insert({ affiliate_id: pendingRef.affiliate_id, event_type: 'REFERRAL_CONVERTED', details: { referral_id: pendingRef.id, order_id: id, amount: order.data.total_amount } }).catch(() => {});
+            console.log(`[Referral] Converted ${pendingRef.id} via delivered order ${id}`);
+          }
+        }
+      } catch (convErr) {
+        console.error('[Referral] Conversion error:', convErr.message);
+      }
+    }
+
     // Send order status update email (fire-and-forget)
     supabase.from('omix_orders').select('email, customer_name').eq('id', id).single()
       .then(({ data: orderData }) => {
