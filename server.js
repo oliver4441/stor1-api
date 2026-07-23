@@ -840,7 +840,7 @@ app.post('/api/auth/signup', async (req, res) => {
         // Look up affiliate by referral code
         const { data: affiliate } = await supabase
           .from('affiliates')
-          .select('id, user_id, tier')
+          .select('id, user_id')
           .eq('referral_code', refCode)
           .eq('status', 'active')
           .single();
@@ -859,28 +859,44 @@ app.post('/api/auth/signup', async (req, res) => {
 
             if (!existing) {
               // Fraud: check if same IP has already been referred by this affiliate
-              const { count: ipRefCount } = await supabase
-                .from('referrals')
-                .select('id', { count: 'exact', head: true })
-                .eq('affiliate_id', affiliate.id)
-                .eq('referred_ip', signupIp);
+              let ipBlocked = false;
+              try {
+                const { count: ipRefCount } = await supabase
+                  .from('referrals')
+                  .select('id', { count: 'exact', head: true })
+                  .eq('affiliate_id', affiliate.id)
+                  .eq('referred_ip', signupIp);
 
-              if (ipRefCount && ipRefCount >= 2) {
-                console.warn(`[Fraud] IP ${signupIp} already referred ${ipRefCount}x for affiliate ${affiliate.id} — blocking`);
-                await supabase.from('activity_logs').insert({
-                  actor: 'system',
-                  action: 'fraud_ip_referral_blocked',
-                  details: JSON.stringify({ ip: signupIp, affiliateId: affiliate.id, count: ipRefCount, userId }),
-                  created_at: new Date().toISOString(),
-                }).catch(() => {});
-              } else {
-                await supabase.from('referrals').insert({
+                if (ipRefCount && ipRefCount >= 2) {
+                  console.warn(`[Fraud] IP ${signupIp} already referred ${ipRefCount}x for affiliate ${affiliate.id} — blocking`);
+                  await supabase.from('activity_logs').insert({
+                    actor: 'system',
+                    action: 'fraud_ip_referral_blocked',
+                    details: JSON.stringify({ ip: signupIp, affiliateId: affiliate.id, count: ipRefCount, userId }),
+                    created_at: new Date().toISOString(),
+                  }).catch(() => {});
+                  ipBlocked = true;
+                }
+              } catch { /* referred_ip column may not exist — skip fraud check */ }
+
+              if (!ipBlocked) {
+                const { error: refInsertErr } = await supabase.from('referrals').insert({
                   affiliate_id: affiliate.id,
                   referred_user_id: userId,
                   status: 'pending',
                   referral_code: refCode,
                   referred_ip: signupIp,
                 });
+                if (refInsertErr) {
+                  // referred_ip column may not exist — retry without it
+                  console.warn('[Signup] Referral insert failed (retrying without referred_ip):', refInsertErr.message);
+                  await supabase.from('referrals').insert({
+                    affiliate_id: affiliate.id,
+                    referred_user_id: userId,
+                    status: 'pending',
+                    referral_code: refCode,
+                  });
+                }
                 // Also set the legacy profiles.referred_by column
                 await supabase.from('profiles').update({ referred_by: affiliate.id }).eq('id', userId);
 
@@ -2387,11 +2403,11 @@ app.get('/api/admin/analytics', requireAdmin, async (req, res) => {
       : '0.0';
 
     // App usage metrics
-    const { data: totalListings } = await supabase
+    const { count: totalListings } = await supabase
       .from('listings')
       .select('id', { count: 'exact', head: true });
 
-    const { data: totalUsers } = await supabase
+    const { count: totalUsers } = await supabase
       .from('profiles')
       .select('id', { count: 'exact', head: true });
 
@@ -2403,8 +2419,8 @@ app.get('/api/admin/analytics', requireAdmin, async (req, res) => {
         totalAllOrders,
         avgOrderValue: totalOrders > 0 ? Math.round(totalRevenue / totalOrders) : 0,
         conversionRate: parseFloat(conversionRate),
-        totalListings: totalListings?.length || 0,
-        totalUsers: totalUsers?.length || 0,
+        totalListings: totalListings || 0,
+        totalUsers: totalUsers || 0,
       },
       cod: {
         totalOrders: codOrders.length,
@@ -3837,7 +3853,7 @@ app.get('/api/affiliate/leaderboard', async (req, res) => {
     // Fetch all active affiliates
     const { data: activeAffiliates } = await supabase
       .from('affiliates')
-      .select('id, user_id, full_name, referral_code, tier')
+      .select('id, user_id, full_name, referral_code')
       .eq('status', 'active');
 
     if (!activeAffiliates?.length) return res.json({ success: true, data: [] });
@@ -3877,7 +3893,7 @@ app.get('/api/affiliate/leaderboard', async (req, res) => {
         user_id: aff.user_id,
         full_name: aff.full_name,
         referral_code: aff.referral_code,
-        tier: aff.tier || 'silver',
+        tier: 'silver',
         total_referrals: totalRefs,
         converted_referrals: convertedRefs,
         total_sales: totalSales,
@@ -3928,11 +3944,10 @@ app.get('/api/affiliate/achievements/:affiliateId', requireAuth, async (req, res
     const totalReferrals = referrals?.length || 0;
     const convertedReferrals = referrals?.filter(r => r.status === 'converted').length || 0;
 
-    const { data: clicks } = await supabase
+    const { count: totalClicks } = await supabase
       .from('referral_clicks')
       .select('id', { count: 'exact', head: true })
       .eq('affiliate_id', affiliateId);
-    const totalClicks = clicks?.length || 0;
 
     // Orders from converted referrals
     let maxOrderAmount = 0;
@@ -3964,11 +3979,11 @@ app.get('/api/affiliate/achievements/:affiliateId', requireAuth, async (req, res
       .eq('status', 'completed');
 
     // Current tier (check if Gold)
-    const { data: affiliate } = await supabase
+    const { data: affiliate, error: tierError } = await supabase
       .from('affiliates')
       .select('tier')
       .eq('id', affiliateId)
-      .single();
+      .maybeSingle();
     const currentTier = affiliate?.tier || 'silver';
 
     // Check each achievement
@@ -4095,12 +4110,10 @@ app.get('/api/affiliate/dashboard/:affiliateId', requireAuth, async (req, res) =
     const convertedReferrals = referrals?.filter(r => r.status === 'converted').length || 0;
 
     // Click counts
-    const { data: clicks } = await supabase
+    const { count: totalClicks } = await supabase
       .from('referral_clicks')
       .select('id', { count: 'exact', head: true })
       .eq('affiliate_id', affiliateId);
-
-    const totalClicks = clicks?.length || 0;
 
     // Current month sales from referred users
     const referredUserIds = referrals?.filter(r => r.status === 'converted').map(r => r.referred_user_id) || [];
