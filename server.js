@@ -797,7 +797,7 @@ app.post('/api/auth/signup', async (req, res) => {
             action: 'fraud_ip_blocked',
             details: JSON.stringify({ ip: signupIp, count: ipCount, refCode: refCodeBlocked }),
             created_at: new Date().toISOString(),
-          }).catch(() => {});
+          });
         } catch (_) {}
       }
     }
@@ -827,12 +827,14 @@ app.post('/api/auth/signup', async (req, res) => {
     if (profileError) throw new Error('Failed to create profile: ' + profileError.message);
 
     // Activity log: new signup
-    await supabase.from('activity_logs').insert({
-      actor: 'system',
-      action: 'user_signed_up',
-      details: JSON.stringify({ userId, email, referralCode: refCode || null, ip: signupIp }),
-      created_at: new Date().toISOString(),
-    }).catch(() => {});
+    try {
+      await supabase.from('activity_logs').insert({
+        actor: 'system',
+        action: 'user_signed_up',
+        details: JSON.stringify({ userId, email, referralCode: refCode || null, ip: signupIp }),
+        created_at: new Date().toISOString(),
+      });
+    } catch {} // guard: catch missing table/column
 
     // 3. Process referral if provided
     if (refCode) {
@@ -906,7 +908,7 @@ app.post('/api/auth/signup', async (req, res) => {
                   action: 'referral_claimed',
                   details: JSON.stringify({ affiliate_id: affiliate.id, referred_user_id: userId, referral_code: refCode, ip: signupIp }),
                   created_at: new Date().toISOString(),
-                }).catch(() => {});
+                });
 
                 // Send referral signup email to affiliate (fire-and-forget)
                 supabase.from('affiliates').select('email, full_name, referral_code').eq('id', affiliate.id).single()
@@ -1527,13 +1529,13 @@ app.post('/api/paystack/webhook', async (req, res) => {
                     amount: existing.total_amount,
                   }),
                   created_at: new Date().toISOString(),
-                }).catch(() => {});
+                });
 
                 await supabase.from('affiliate_logs').insert({
                   affiliate_id: pendingRef.affiliate_id,
                   event_type: 'REFERRAL_CONVERTED',
                   details: { referral_id: pendingRef.id, order_id: metadata.order_id, amount: existing.total_amount },
-                }).catch(() => {});
+                });
 
                 console.log(`[Referral] Converted ${pendingRef.id} for user ${existing.user_id} via order ${metadata.order_id}`);
               }
@@ -4063,9 +4065,13 @@ app.get('/api/affiliate/achievements/:affiliateId', requireAuth, async (req, res
         achievement_id: ach.id,
         earned_at: new Date().toISOString(),
       }));
-      await supabase.from('user_achievements').upsert(upsertData, {
-        onConflict: 'user_id,achievement_id',
-      }).catch(err => console.error('[Achievements] Upsert error:', err.message));
+      try {
+        await supabase.from('user_achievements').upsert(upsertData, {
+          onConflict: 'user_id,achievement_id',
+        });
+      } catch (err) {
+        console.error('[Achievements] Upsert error:', err.message);
+      }
       // Mark earned_at in the response so frontend sees it as fresh-earned
       newlyEarned.forEach(ach => { ach.earned_at = new Date().toISOString(); });
     }
@@ -5141,8 +5147,8 @@ app.post('/api/admin/orders/:id/status',
 
           if (pendingRef) {
             await supabase.from('referrals').update({ status: 'converted', converted_at: new Date().toISOString(), first_order_id: id }).eq('id', pendingRef.id);
-            await supabase.from('activity_logs').insert({ actor: 'system', action: 'referral_converted', details: JSON.stringify({ referral_id: pendingRef.id, affiliate_id: pendingRef.affiliate_id, referred_user_id: order.data.user_id, order_id: id, amount: order.data.total_amount }), created_at: new Date().toISOString() }).catch(() => {});
-            await supabase.from('affiliate_logs').insert({ affiliate_id: pendingRef.affiliate_id, event_type: 'REFERRAL_CONVERTED', details: { referral_id: pendingRef.id, order_id: id, amount: order.data.total_amount } }).catch(() => {});
+            await supabase.from('activity_logs').insert({ actor: 'system', action: 'referral_converted', details: JSON.stringify({ referral_id: pendingRef.id, affiliate_id: pendingRef.affiliate_id, referred_user_id: order.data.user_id, order_id: id, amount: order.data.total_amount }), created_at: new Date().toISOString() });
+            await supabase.from('affiliate_logs').insert({ affiliate_id: pendingRef.affiliate_id, event_type: 'REFERRAL_CONVERTED', details: { referral_id: pendingRef.id, order_id: id, amount: order.data.total_amount } });
 
             // Send referral reward email to affiliate (fire-and-forget)
             supabase.from('affiliates').select('email, referral_code, full_name').eq('id', pendingRef.affiliate_id).single()
