@@ -5745,28 +5745,138 @@ app.post('/api/mpesa/callback', async (req, res) => {
     console.log(`[M-Pesa] Callback for ${CheckoutRequestID}: ${ResultCode} - ${ResultDesc}`);
 
     if (ResultCode === 0 && CallbackMetadata?.Item) {
-      // Extract payment metadata
       const meta = {};
       CallbackMetadata.Item.forEach(item => { meta[item.Name] = item.Value; });
 
-      // Update order status to paid
       const { data: orders } = await supabase
         .from('omix_orders')
-        .update({ status: 'paid', mpesa_receipt: meta.MpesaReceiptNumber, paid_at: new Date().toISOString() })
-        .eq('mpesa_checkout_id', CheckoutRequestID)
-        .select('id');
+        .select('id, user_id, email, customer_name, total_amount, area, landmark, status')
+        .eq('mpesa_checkout_id', CheckoutRequestID);
 
-      if (orders?.length) {
-        console.log(`[M-Pesa] Order ${orders[0].id} marked paid, receipt: ${meta.MpesaReceiptNumber}`);
-        // ponytail: stock decrement follows existing Paystack webhook pattern (lines 1500-1550)
-        // Could extract shared fn, but 2 callers don't justify it yet
+      const existing = orders?.[0];
+      if (existing && existing.status !== 'paid') {
+        // Fetch order items for email and stock tracking
+        const { data: orderItems } = await supabase
+          .from('omix_order_items')
+          .select('product_id, product_name, price, quantity, variant')
+          .eq('order_id', existing.id);
+
+        // Stock decrement
+        if (orderItems?.length) {
+          for (const item of orderItems) {
+            if (!item.product_id) continue;
+            try {
+              const { data: product } = await supabase
+                .from('listings')
+                .select('stock_quantity, quantity, status, purchase_count')
+                .eq('id', item.product_id)
+                .single();
+
+              if (product) {
+                const currentStock = product.stock_quantity ?? product.quantity ?? 0;
+                const newStock = Math.max(0, currentStock - item.quantity);
+                const currentPurchaseCount = product.purchase_count ?? 0;
+                let newStatus = product.status;
+                if (newStock <= 0) newStatus = 'sold';
+
+                const updateFields = {
+                  status: newStatus,
+                  purchase_count: currentPurchaseCount + item.quantity,
+                  updated_at: new Date().toISOString(),
+                };
+                if (product.stock_quantity !== undefined) updateFields.stock_quantity = newStock;
+                if (product.quantity !== undefined) updateFields.quantity = newStock;
+                if (currentPurchaseCount + item.quantity > 5) updateFields.featured = true;
+
+                await supabase.from('listings').update(updateFields).eq('id', item.product_id);
+                console.log(`[Stock] Product ${item.product_id}: ${currentStock} -> ${newStock}`);
+              }
+            } catch (stockErr) {
+              console.error(`[Stock] Failed for product ${item.product_id}:`, stockErr.message);
+            }
+          }
+        }
+
+        // Mark paid
+        await supabase
+          .from('omix_orders')
+          .update({ status: 'paid', mpesa_receipt: meta.MpesaReceiptNumber, paid_at: new Date().toISOString() })
+          .eq('id', existing.id);
+
+        console.log(`[M-Pesa] Order ${existing.id} paid, receipt: ${meta.MpesaReceiptNumber}`);
+
+        // Referral conversion
+        try {
+          const { data: pendingRef } = await supabase
+            .from('referrals')
+            .select('id, affiliate_id, status')
+            .eq('referred_user_id', existing.user_id)
+            .eq('status', 'pending')
+            .maybeSingle();
+
+          if (pendingRef) {
+            await supabase.from('referrals').update({
+              status: 'converted', converted_at: new Date().toISOString(), first_order_id: existing.id,
+            }).eq('id', pendingRef.id);
+
+            await supabase.from('activity_logs').insert({
+              actor: 'system', action: 'referral_converted',
+              details: JSON.stringify({ referral_id: pendingRef.id, affiliate_id: pendingRef.affiliate_id, referred_user_id: existing.user_id, order_id: existing.id, amount: existing.total_amount }),
+              created_at: new Date().toISOString(),
+            });
+            await supabase.from('affiliate_logs').insert({
+              affiliate_id: pendingRef.affiliate_id, event_type: 'REFERRAL_CONVERTED',
+              details: { referral_id: pendingRef.id, order_id: existing.id, amount: existing.total_amount },
+            });
+            console.log(`[Referral] Converted ${pendingRef.id} for user ${existing.user_id} via order ${existing.id}`);
+          }
+        } catch (convErr) {
+          console.error('[Referral] Conversion error:', convErr.message);
+        }
+
+        // Order confirmation email
+        if (existing.email) {
+          const itemsForEmail = (orderItems || []).map(item => ({
+            ...item,
+            name: item.product_name + (
+              item.variant?.label ? ` (${item.variant.label})`
+                : (item.variant?.size || item.variant?.colorName)
+                  ? ` (${item.variant.size || ''}${item.variant.size && item.variant.colorName ? ', ' : ''}${item.variant.colorName || ''})` : ''
+            ),
+          }));
+          emailLib.sendOrderConfirmation({
+            to: existing.email,
+            orderId: existing.id,
+            items: itemsForEmail,
+            total: existing.total_amount,
+            customerName: existing.customer_name,
+            deliveryArea: existing.area,
+            deliveryLandmark: existing.landmark,
+          }).catch(err => console.error('[Email] Order confirmation failed:', err.message));
+
+          // Referral reward email (fire-and-forget)
+          supabase.from('referrals')
+            .select('affiliate_id').eq('referred_user_id', existing.user_id).eq('status', 'converted').single()
+            .then(({ data: referral }) => {
+              if (!referral) return;
+              supabase.from('affiliates').select('email, referral_code, full_name').eq('id', referral.affiliate_id).single()
+                .then(({ data: aff }) => {
+                  if (aff?.email) {
+                    emailLib.sendReferralReward({
+                      to: aff.email, referralCode: aff.referral_code,
+                      rewardAmount: existing.total_amount ? Math.round(existing.total_amount * 0.05) : 100,
+                      customerName: aff.full_name,
+                    }).catch(err => console.warn('[Email] Referral reward failed:', err.message));
+                  }
+                }).catch(() => {});
+            }).catch(() => {});
+        }
       }
     }
-    // Always respond with success to Safaricom (they retry on non-200)
     res.json({ ResultCode: 0, ResultDesc: 'Success' });
   } catch (err) {
     console.error('[M-Pesa] Callback error:', err.message);
-    res.json({ ResultCode: 0, ResultDesc: 'Accepted' }); // don't let Safaricom retry
+    res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
   }
 });
 
