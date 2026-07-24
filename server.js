@@ -5985,3 +5985,4 @@ app.listen(PORT, () => {
   ensureConfigBucket().catch(e => console.warn('[config] bucket ensure failed:', e.message));
 });
 // CRON_SECRET pick up marker
+// trigger redeploy Fri Jul 24 17:30:04 UTC 2026
