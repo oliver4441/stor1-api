@@ -17,6 +17,7 @@ import { sendNotification as onesignalSend } from './lib/onesignal.js';
 import * as meiliSearch from './lib/meilisearch.js';
 import * as cjApi from './lib/cj.js';
 import { body, param, validationResult } from 'express-validator';
+import rateLimit from 'express-rate-limit';
 import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } from '@simplewebauthn/server';
 
 // ── WebAuthn (biometric/passkey) config ──
