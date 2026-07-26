@@ -3392,6 +3392,43 @@ async function requireAuth(req, res, next) {
   }
 }
 
+// Require user (any authenticated user) middleware — pattern from requireAdmin
+async function requireUser(req, res, next) {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+
+    let token = null;
+    const authHeader = req.headers.authorization;
+    if (authHeader?.startsWith('Bearer ')) {
+      token = authHeader.slice(7);
+    } else if (req.headers.cookie) {
+      for (const c of req.headers.cookie.split(';')) {
+        const eq = c.indexOf('=');
+        const key = eq > 0 ? c.slice(0, eq).trim() : c.trim();
+        const val = eq > 0 ? c.slice(eq + 1).trim() : '';
+        if (key.startsWith('sb-') && key.endsWith('-auth-token')) {
+          try {
+            const session = JSON.parse(decodeURIComponent(val));
+            token = session.access_token || null;
+          } catch { /* ignore */ }
+          break;
+        }
+      }
+    }
+
+    if (!token) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+    req.user = user;
+    next();
+  } catch (err) {
+    console.error('requireUser error:', err.message);
+    res.status(401).json({ error: 'Unauthorized' });
+  }
+}
+
 // 1. GET /api/affiliate/profile/:userId — Get affiliate by user ID
 app.get('/api/affiliate/profile/:userId', requireAuth, async (req, res) => {
   try {
@@ -6102,10 +6139,583 @@ app.post('/api/admin/reset-database', async (req, res) => {
   }
 });
 
+// ── Database Migrations (run at startup) ──
+async function runMigrations() {
+  if (!supabase) {
+    console.warn('[Migrations] Supabase not available, skipping');
+    return;
+  }
+  console.log('[Migrations] Starting schema migrations...');
+
+  const migrations = [
+    // M7: Add video_url to listings
+    `ALTER TABLE listings ADD COLUMN IF NOT EXISTS video_url TEXT;`,
+
+    // M8: Reports table
+    `CREATE TABLE IF NOT EXISTS reports (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      reporter_id UUID,
+      listing_id UUID,
+      reason TEXT NOT NULL,
+      description TEXT,
+      status TEXT DEFAULT 'pending',
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );`,
+
+    // M9: Wallets and wallet_transactions tables
+    `CREATE TABLE IF NOT EXISTS wallets (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID UNIQUE,
+      balance DECIMAL(12,2) DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS wallet_transactions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      wallet_id UUID,
+      amount DECIMAL(12,2) NOT NULL,
+      type TEXT NOT NULL,
+      reference TEXT,
+      description TEXT,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );`,
+
+    // M10: Abandoned carts table
+    `CREATE TABLE IF NOT EXISTS abandoned_carts (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      session_id TEXT,
+      user_id UUID,
+      email TEXT,
+      items JSONB DEFAULT '[]',
+      total DECIMAL(12,2) DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      recovered BOOLEAN DEFAULT false
+    );`,
+
+    // M11: Gift cards and gift_card_redemptions tables
+    `CREATE TABLE IF NOT EXISTS gift_cards (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      code TEXT UNIQUE NOT NULL,
+      amount DECIMAL(12,2) NOT NULL,
+      balance DECIMAL(12,2) NOT NULL,
+      purchaser_id UUID,
+      recipient_email TEXT,
+      message TEXT,
+      expires_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      active BOOLEAN DEFAULT true
+    );
+    CREATE TABLE IF NOT EXISTS gift_card_redemptions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      gift_card_id UUID,
+      amount DECIMAL(12,2) NOT NULL,
+      order_id TEXT,
+      redeemed_at TIMESTAMPTZ DEFAULT now()
+    );`,
+
+    // M12: Saved payment methods table
+    `CREATE TABLE IF NOT EXISTS saved_payment_methods (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      type TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      last_four TEXT,
+      expiry_date TEXT,
+      cardholder_name TEXT,
+      is_default BOOLEAN DEFAULT false,
+      metadata JSONB DEFAULT '{}',
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );`,
+
+    // M13: Bundles and bundle_items tables
+    `CREATE TABLE IF NOT EXISTS bundles (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      name TEXT NOT NULL,
+      description TEXT,
+      slug TEXT UNIQUE,
+      image TEXT,
+      price DECIMAL(12,2) NOT NULL,
+      original_price DECIMAL(12,2),
+      active BOOLEAN DEFAULT true,
+      starts_at TIMESTAMPTZ,
+      ends_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS bundle_items (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      bundle_id UUID REFERENCES bundles(id) ON DELETE CASCADE,
+      listing_id UUID REFERENCES listings(id) ON DELETE CASCADE,
+      quantity INTEGER DEFAULT 1
+    );`,
+
+    // M14: Seller reviews table
+    `CREATE TABLE IF NOT EXISTS seller_reviews (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      seller_id UUID NOT NULL,
+      reviewer_id UUID NOT NULL,
+      rating INTEGER NOT NULL CHECK (rating >= 1 AND rating <= 5),
+      review TEXT,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      UNIQUE(seller_id, reviewer_id)
+    );`,
+  ];
+
+  for (const sql of migrations) {
+    try {
+      const { error } = await supabase.rpc('exec_sql_raw', { query_text: sql });
+      if (error) console.error('[Migrations] Error:', error.message);
+    } catch (err) {
+      console.error('[Migrations] Exception:', err.message);
+    }
+  }
+
+  console.log('[Migrations] Schema migrations completed');
+}
+
+// ── Reports API ─────────────────────────────────────────────────────
+// POST /api/reports — Submit a report (requireUser)
+app.post('/api/reports', requireUser, async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { listing_id, reason, description } = req.body;
+    if (!listing_id || !reason) {
+      return res.status(400).json({ error: 'listing_id and reason are required' });
+    }
+    const { data, error } = await supabase.from('reports').insert({
+      reporter_id: req.user.id,
+      listing_id,
+      reason,
+      description,
+    }).select('*').single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.status(201).json({ success: true, report: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Wallet API ──────────────────────────────────────────────────────
+// GET /api/wallet/:userId — Get wallet (requireUser)
+app.get('/api/wallet/:userId', requireUser, async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    // IDOR guard: only the owner or admin
+    if (req.params.userId !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    let { data, error } = await supabase
+      .from('wallets')
+      .select('*')
+      .eq('user_id', req.params.userId)
+      .maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    // Auto-create wallet if it doesn't exist
+    if (!data) {
+      const { data: newWallet, error: createError } = await supabase
+        .from('wallets')
+        .insert({ user_id: req.params.userId, balance: 0 })
+        .select('*')
+        .single();
+      if (createError) return res.status(500).json({ error: createError.message });
+      data = newWallet;
+    }
+    res.json({ success: true, wallet: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/wallet/top-up — Top up wallet (requireUser)
+app.post('/api/wallet/top-up', requireUser, async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { amount, reference } = req.body;
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ error: 'Valid amount is required' });
+    }
+    // Get or create wallet
+    let { data: wallet } = await supabase
+      .from('wallets')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (!wallet) {
+      const { data: nw } = await supabase
+        .from('wallets')
+        .insert({ user_id: req.user.id, balance: 0 })
+        .select('*')
+        .single();
+      wallet = nw;
+    }
+    const newBalance = parseFloat(wallet.balance) + parseFloat(amount);
+    const { error: updateError } = await supabase
+      .from('wallets')
+      .update({ balance: newBalance, updated_at: new Date().toISOString() })
+      .eq('id', wallet.id);
+    if (updateError) return res.status(500).json({ error: updateError.message });
+    // Record transaction
+    await supabase.from('wallet_transactions').insert({
+      wallet_id: wallet.id,
+      amount: parseFloat(amount),
+      type: 'credit',
+      reference: reference || null,
+      description: 'Wallet top-up',
+    });
+    res.json({ success: true, balance: newBalance });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/wallet/use — Use wallet for payment (requireUser)
+app.post('/api/wallet/use', requireUser, async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { amount, order_id } = req.body;
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ error: 'Valid amount is required' });
+    }
+    const { data: wallet, error: wError } = await supabase
+      .from('wallets')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (wError) return res.status(500).json({ error: wError.message });
+    if (!wallet) return res.status(400).json({ error: 'No wallet found' });
+    if (parseFloat(wallet.balance) < parseFloat(amount)) {
+      return res.status(400).json({ error: 'Insufficient balance' });
+    }
+    const newBalance = parseFloat(wallet.balance) - parseFloat(amount);
+    const { error: updateError } = await supabase
+      .from('wallets')
+      .update({ balance: newBalance, updated_at: new Date().toISOString() })
+      .eq('id', wallet.id);
+    if (updateError) return res.status(500).json({ error: updateError.message });
+    await supabase.from('wallet_transactions').insert({
+      wallet_id: wallet.id,
+      amount: parseFloat(amount),
+      type: 'debit',
+      reference: order_id || null,
+      description: 'Payment for order',
+    });
+    res.json({ success: true, balance: newBalance, message: 'Payment successful' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Gift Cards API ──────────────────────────────────────────────────
+// POST /api/gift-cards/purchase — Buy gift card (requireUser)
+app.post('/api/gift-cards/purchase', requireUser, async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { amount, recipient_email, message } = req.body;
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ error: 'Valid amount is required' });
+    }
+    // Generate unique code
+    const code = 'GC-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).substring(2, 8).toUpperCase();
+    const { data, error } = await supabase.from('gift_cards').insert({
+      code,
+      amount: parseFloat(amount),
+      balance: parseFloat(amount),
+      purchaser_id: req.user.id,
+      recipient_email: recipient_email || null,
+      message: message || null,
+    }).select('*').single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.status(201).json({ success: true, gift_card: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/gift-cards/:code — Lookup gift card (public)
+app.get('/api/gift-cards/:code', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { data, error } = await supabase
+      .from('gift_cards')
+      .select('*')
+      .eq('code', req.params.code)
+      .maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: 'Gift card not found' });
+    if (!data.active) return res.status(400).json({ error: 'Gift card is inactive' });
+    res.json({ success: true, gift_card: { code: data.code, balance: data.balance, active: data.active } });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/gift-cards/redeem — Redeem gift card (requireUser)
+app.post('/api/gift-cards/redeem', requireUser, async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { code, order_id } = req.body;
+    if (!code) return res.status(400).json({ error: 'Gift card code is required' });
+    const { data: card, error: cError } = await supabase
+      .from('gift_cards')
+      .select('*')
+      .eq('code', code)
+      .maybeSingle();
+    if (cError) return res.status(500).json({ error: cError.message });
+    if (!card) return res.status(404).json({ error: 'Gift card not found' });
+    if (!card.active) return res.status(400).json({ error: 'Gift card is inactive' });
+    if (parseFloat(card.balance) <= 0) return res.status(400).json({ error: 'Gift card has no balance' });
+    const amount = parseFloat(card.balance);
+    const { error: updateError } = await supabase
+      .from('gift_cards')
+      .update({ balance: 0, active: false })
+      .eq('id', card.id);
+    if (updateError) return res.status(500).json({ error: updateError.message });
+    await supabase.from('gift_card_redemptions').insert({
+      gift_card_id: card.id,
+      amount,
+      order_id: order_id || null,
+    });
+    res.json({ success: true, amount_redeemed: amount, message: 'Gift card redeemed' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Bundles API ─────────────────────────────────────────────────────
+// GET /api/bundles/active — Active bundles (public)
+app.get('/api/bundles/active', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const now = new Date().toISOString();
+    const { data, error } = await supabase
+      .from('bundles')
+      .select('*')
+      .eq('active', true)
+      .lte('starts_at', now)
+      .gte('ends_at', now)
+      .order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ success: true, bundles: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/bundles/:id — Bundle with items (public)
+app.get('/api/bundles/:id', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { data, error } = await supabase
+      .from('bundles')
+      .select('*, bundle_items(*, listing:listings(*))')
+      .eq('id', req.params.id)
+      .maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: 'Bundle not found' });
+    res.json({ success: true, bundle: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/bundles — Create bundle (requireAdmin)
+app.post('/api/bundles', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { name, description, slug, image, price, original_price, items, starts_at, ends_at } = req.body;
+    if (!name || !price) {
+      return res.status(400).json({ error: 'name and price are required' });
+    }
+    const { data: bundle, error: bError } = await supabase.from('bundles').insert({
+      name,
+      description,
+      slug: slug || name.toLowerCase().replace(/\s+/g, '-'),
+      image,
+      price: parseFloat(price),
+      original_price: original_price ? parseFloat(original_price) : null,
+      starts_at: starts_at || new Date().toISOString(),
+      ends_at: ends_at || null,
+    }).select('*').single();
+    if (bError) return res.status(400).json({ error: bError.message });
+    // Insert bundle items if provided
+    if (items && Array.isArray(items) && items.length > 0) {
+      const bundleItems = items.map(item => ({
+        bundle_id: bundle.id,
+        listing_id: item.listing_id,
+        quantity: item.quantity || 1,
+      }));
+      const { error: iError } = await supabase.from('bundle_items').insert(bundleItems);
+      if (iError) console.error('[Bundle] Insert items error:', iError.message);
+    }
+    res.status(201).json({ success: true, bundle });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Seller Reviews API ──────────────────────────────────────────────
+// POST /api/seller-reviews — Submit seller review (requireUser)
+app.post('/api/seller-reviews', requireUser, async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { seller_id, rating, review } = req.body;
+    if (!seller_id || !rating) {
+      return res.status(400).json({ error: 'seller_id and rating are required' });
+    }
+    if (rating < 1 || rating > 5) {
+      return res.status(400).json({ error: 'Rating must be between 1 and 5' });
+    }
+    const { data, error } = await supabase.from('seller_reviews').insert({
+      seller_id,
+      reviewer_id: req.user.id,
+      rating,
+      review: review || null,
+    }).select('*').single();
+    if (error) {
+      if (error.code === '23505') {
+        return res.status(409).json({ error: 'You have already reviewed this seller' });
+      }
+      return res.status(400).json({ error: error.message });
+    }
+    res.status(201).json({ success: true, review: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/seller-reviews/:sellerId — Get seller reviews (public)
+app.get('/api/seller-reviews/:sellerId', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { data, error } = await supabase
+      .from('seller_reviews')
+      .select('*, reviewer:profiles(full_name, avatar_url)')
+      .eq('seller_id', req.params.sellerId)
+      .order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    // Compute average rating
+    let avgRating = 0;
+    if (data && data.length > 0) {
+      avgRating = data.reduce((sum, r) => sum + r.rating, 0) / data.length;
+    }
+    res.json({
+      success: true,
+      reviews: data || [],
+      average_rating: Math.round(avgRating * 10) / 10,
+      total_reviews: data?.length || 0,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Abandoned Cart API ─────────────────────────────────────────────
+// POST /api/cart/abandon — Save abandoned cart (public)
+app.post('/api/cart/abandon', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { session_id, user_id, email, items, total } = req.body;
+    if (!items) return res.status(400).json({ error: 'items are required' });
+    // Upsert: update if same session/user exists
+    const { data, error } = await supabase.from('abandoned_carts').upsert({
+      session_id: session_id || null,
+      user_id: user_id || null,
+      email: email || null,
+      items: typeof items === 'string' ? items : JSON.stringify(items),
+      total: parseFloat(total || 0),
+    }, { onConflict: 'session_id' }).select('*').single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, cart: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Saved Payment Methods API ───────────────────────────────────────
+// GET /api/saved-payment-methods/:userId — List saved methods (requireUser)
+app.get('/api/saved-payment-methods/:userId', requireUser, async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    if (req.params.userId !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    const { data, error } = await supabase
+      .from('saved_payment_methods')
+      .select('*')
+      .eq('user_id', req.params.userId)
+      .order('is_default', { ascending: false })
+      .order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ success: true, methods: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/saved-payment-methods — Save a payment method (requireUser)
+app.post('/api/saved-payment-methods', requireUser, async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    const { type, provider, last_four, expiry_date, cardholder_name, is_default, metadata } = req.body;
+    if (!type || !provider) {
+      return res.status(400).json({ error: 'type and provider are required' });
+    }
+    // If setting as default, unset others first
+    if (is_default) {
+      await supabase
+        .from('saved_payment_methods')
+        .update({ is_default: false })
+        .eq('user_id', req.user.id);
+    }
+    const { data, error } = await supabase.from('saved_payment_methods').insert({
+      user_id: req.user.id,
+      type,
+      provider,
+      last_four: last_four || null,
+      expiry_date: expiry_date || null,
+      cardholder_name: cardholder_name || null,
+      is_default: is_default || false,
+      metadata: metadata || {},
+    }).select('*').single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.status(201).json({ success: true, method: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/saved-payment-methods/:id — Delete a payment method (requireUser)
+app.delete('/api/saved-payment-methods/:id', requireUser, async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Database not available' });
+    // Only owner or admin can delete
+    const { data: method } = await supabase
+      .from('saved_payment_methods')
+      .select('user_id')
+      .eq('id', req.params.id)
+      .maybeSingle();
+    if (!method) return res.status(404).json({ error: 'Method not found' });
+    if (method.user_id !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    const { error } = await supabase
+      .from('saved_payment_methods')
+      .delete()
+      .eq('id', req.params.id);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ success: true, message: 'Payment method deleted' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 Omix API server running on port ${PORT}`);
   console.log(`   Paystack: ${PAYSTACK_SECRET?.startsWith('sk_live') ? 'PRODUCTION' : 'TEST'}`);
   console.log(`   Subaccount: ${OMIX_SUBACCOUNT_CODE || 'Not configured'}`);
   ensureConfigBucket().catch(e => console.warn('[config] bucket ensure failed:', e.message));
+  runMigrations().catch(e => console.warn('[migrations] failed:', e.message));
 });
 // CRON_SECRET pick up marker
