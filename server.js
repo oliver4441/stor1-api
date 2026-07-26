@@ -2541,12 +2541,13 @@ async function requireAdmin(req, res, next) {
     if (error || !user) return res.status(401).json({ error: 'Unauthorized' });
 
     // Check admin role in profiles
-    const { data: profile } = await supabase
+    const { data: profile, error: profileErr } = await supabase
       .from('profiles')
       .select('role')
       .eq('id', user.id)
-      .single();
+      .maybeSingle();
 
+    if (profileErr) throw profileErr;
     if (!profile || profile.role !== 'admin') {
       return res.status(403).json({ error: 'Admin access required' });
     }
@@ -5995,6 +5996,18 @@ app.use((err, req, res, next) => {
 app.post('/api/admin/reset-database', async (req, res) => {
   try {
     if (!supabase) return res.status(503).json({ error: 'Database not available' });
+
+    // Auth: require admin or cron secret (same pattern as commission calc)
+    const cronKey = req.query.key;
+    const cronSecret = process.env.CRON_SECRET;
+    if (!(cronKey && cronKey === cronSecret)) {
+      // Still need to call requireAdmin as middleware — it sets req.user
+      return new Promise((resolve) => {
+        requireAdmin(req, res, () => {
+          resolve();
+        });
+      });
+    }
 
     const ADMIN_EMAIL = 'admin.omixsystems@gmail.com';
     const ADMIN_PASS = 'marvelxnasha';
