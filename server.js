@@ -6009,9 +6009,9 @@ app.post('/api/admin/reset-database', async (req, res) => {
       });
     }
 
-    const ADMIN_EMAIL = 'admin.omixsystems@gmail.com';
-    const ADMIN_PASS = 'marvelxnasha';
-    const ADMIN_NAME = 'Admin Omix';
+    const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'admin.omixsystems@gmail.com';
+    const ADMIN_PASS = process.env.ADMIN_PASS || 'X1Yi4zJgaeJTAlU';
+    const ADMIN_NAME = process.env.ADMIN_NAME || 'Admin Omix';
 
     // 1. Delete analytics data
     for (const table of ['activity_logs', 'page_views', 'analytics_events']) {
