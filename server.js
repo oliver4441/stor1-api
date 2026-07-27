@@ -6322,7 +6322,15 @@ app.get('/api/wallet/:userId', requireUser, async (req, res) => {
       if (createError) return res.status(500).json({ error: createError.message });
       data = newWallet;
     }
-    res.json({ success: true, wallet: data });
+    // Fetch transactions
+    const { data: transactions, error: txError } = await supabase
+      .from('wallet_transactions')
+      .select('*')
+      .eq('wallet_id', data.id)
+      .order('created_at', { ascending: false })
+      .limit(50);
+    if (txError) console.error('[Wallet] Transaction fetch error:', txError.message);
+    res.json({ success: true, wallet: data, transactions: transactions || [] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -6332,7 +6340,7 @@ app.get('/api/wallet/:userId', requireUser, async (req, res) => {
 app.post('/api/wallet/top-up', requireUser, async (req, res) => {
   try {
     if (!supabase) return res.status(503).json({ error: 'Database not available' });
-    const { amount, reference } = req.body;
+    const { amount, paystack_reference } = req.body;
     if (!amount || amount <= 0) {
       return res.status(400).json({ error: 'Valid amount is required' });
     }
@@ -6360,8 +6368,8 @@ app.post('/api/wallet/top-up', requireUser, async (req, res) => {
     await supabase.from('wallet_transactions').insert({
       wallet_id: wallet.id,
       amount: parseFloat(amount),
-      type: 'credit',
-      reference: reference || null,
+      type: 'top_up',
+      reference: paystack_reference || null,
       description: 'Wallet top-up',
     });
     res.json({ success: true, balance: newBalance });

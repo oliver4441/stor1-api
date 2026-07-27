@@ -73,7 +73,10 @@ INSERT INTO public.pickup_stations (name, area, address, landmark, sort_order) V
   ('Omix Store - Brooke', 'Brooke', 'Brooke Market Area', 'Near Brooke Tea Factory', 3),
   ('Omix Store - Sosiot', 'Sosiot', 'Sosiot Town Centre', 'Next to Sosiot Stage', 4),
   ('Omix Store - Kipkelion', 'Kipkelion', 'Kipkelion Town', 'Near Kipkelion Market', 5)
-ON CONFLICT DO NOTHING;
+ON CONFLICT (name, area) DO NOTHING;
+
+-- Add unique constraint to prevent duplicate pickup stations
+ALTER TABLE public.pickup_stations ADD CONSTRAINT unique_pickup_station UNIQUE (name, area);
 
 ALTER TABLE public.pickup_stations ENABLE ROW LEVEL SECURITY;
 
