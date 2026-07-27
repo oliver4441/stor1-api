@@ -6272,6 +6272,13 @@ async function runMigrations() {
     }
   }
 
+  // Notify PostgREST to reload its schema cache so new tables are visible
+  try {
+    await supabase.rpc('exec_sql_raw', { query_text: "NOTIFY pgrst, 'reload schema';" });
+  } catch (err) {
+    console.warn('[Migrations] Schema reload notify failed (non-critical):', err.message);
+  }
+
   console.log('[Migrations] Schema migrations completed');
 }
 
