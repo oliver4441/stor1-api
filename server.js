@@ -6359,9 +6359,10 @@ app.post('/api/wallet/top-up', requireUser, async (req, res) => {
       wallet = nw;
     }
     const newBalance = parseFloat(wallet.balance) + parseFloat(amount);
+    const newTotalToppedUp = (wallet.total_topped_up || 0) + parseFloat(amount);
     const { error: updateError } = await supabase
       .from('wallets')
-      .update({ balance: newBalance, updated_at: new Date().toISOString() })
+      .update({ balance: newBalance, total_topped_up: newTotalToppedUp, updated_at: new Date().toISOString() })
       .eq('id', wallet.id);
     if (updateError) return res.status(500).json({ error: updateError.message });
     // Record transaction
@@ -6409,6 +6410,15 @@ app.post('/api/wallet/use', requireUser, async (req, res) => {
       reference: order_id || null,
       description: 'Payment for order',
     });
+
+    // Mark order as paid
+    if (order_id) {
+      await supabase
+        .from('omix_orders')
+        .update({ status: 'paid', updated_at: new Date().toISOString() })
+        .eq('id', order_id);
+    }
+
     res.json({ success: true, balance: newBalance, message: 'Payment successful' });
   } catch (err) {
     res.status(500).json({ error: err.message });
